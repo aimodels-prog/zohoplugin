@@ -1,0 +1,22 @@
+# APPEND this block to /opt/via/proxy/Caddyfile on the VPS.
+# Do NOT replace that file — it serves via-portal, via-cvtool and vendorapp.
+#
+# Back it up first:
+#   cp /opt/via/proxy/Caddyfile /opt/via/proxy/Caddyfile.bak-$(date +%F)
+#
+# Then reload (from /opt/via/proxy):
+#   docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile
+#   docker compose exec caddy caddy reload   --config /etc/caddy/Caddyfile
+#
+# zoho-mcp-app resolves over the via_proxy Docker network — no host port involved.
+
+books-mcp.via-int.com {
+	encode gzip
+
+	reverse_proxy zoho-mcp-app:8080
+
+	log {
+		output file /var/log/caddy/books-mcp.log
+		format console
+	}
+}

@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: zoho-books-mcp
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_REFRESH_TOKEN
+        sync: false
+      - key: ZOHO_ORGANIZATION_ID
+        sync: false
+      - key: ZOHO_REGION
+        value: com
+      - key: MCP_API_KEY
+        generateValue: true
+      - key: ZOHO_READ_ONLY
+        value: "false"

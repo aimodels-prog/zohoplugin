@@ -1,0 +1,16 @@
+# Caddy obtains and renews the Let's Encrypt certificate automatically.
+# Requires: DNS for {$DOMAIN} points at this server, and ports 80 + 443 are reachable.
+
+{$DOMAIN} {
+	encode gzip
+
+	reverse_proxy app:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

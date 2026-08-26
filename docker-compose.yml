@@ -1,0 +1,61 @@
+# Slots into the existing via-proxy stack on this VPS.
+#
+# Nothing here publishes a host port. The app joins the `via_proxy` network so the
+# existing via-caddy container can reach it by name (zoho-mcp-app:8080) and terminate
+# TLS for it. Postgres stays on a private network reachable only by the app.
+#
+# `name:` namespaces containers, networks and volumes so they cannot collide with
+# via-proxy, vendorapp, or anything else already running.
+
+name: zoho-books-mcp
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: zoho-mcp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zoho
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: zoho_books
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zoho -d zoho_books"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+    # Separate from via-postgres on purpose: your existing database is never touched.
+
+  app:
+    build: .
+    container_name: zoho-mcp-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://zoho:${POSTGRES_PASSWORD}@postgres:5432/zoho_books
+      DATABASE_SSL: "false"
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
+      ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID:?set ZOHO_CLIENT_ID in .env}
+      ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET:?set ZOHO_CLIENT_SECRET in .env}
+      ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:-}
+      ZOHO_READ_ONLY: ${ZOHO_READ_ONLY:-false}
+      MAX_RESPONSE_CHARS: ${MAX_RESPONSE_CHARS:-60000}
+    networks:
+      - internal   # to reach postgres
+      - via_proxy  # so via-caddy can reach this container
+    # No `ports:` — deliberately not reachable from the internet except through Caddy.
+
+networks:
+  internal:
+    driver: bridge
+  via_proxy:
+    external: true
+
+volumes:
+  pgdata:
