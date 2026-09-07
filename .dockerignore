@@ -10,3 +10,6 @@ Caddyfile
 docker-compose.yml
 render.yaml
 run-local.ps1
+test
+.github
+coverage

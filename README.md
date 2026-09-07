@@ -1,270 +1,110 @@
-# Zoho Books MCP Server for ChatGPT
+# Zoho Books MCP ? version 3
 
-Exposes 60 Zoho Books tools to ChatGPT as a custom connector.
+A multi-user OAuth server for Zoho Books. Every caller uses their own linked Zoho account. Accounting records remain in Zoho; temporary encrypted report snapshots preserve the evidence used to calculate an answer.
 
-Read 30 · Create 12 · Update 10 · Delete 8
+## Accuracy contract
 
----
+- Every call names its organization(s); an account preference never silently changes report scope.
+- Monetary values are decimal strings. Exact sums are retained; display rounding follows currency precision, including OMR's three decimals.
+- Transaction currency and organization base currency are separate. Base reports use recorded `bcy_*` amounts or an explicitly matching transaction currency. Missing amounts/currencies invalidate the result; no exchange rates are guessed.
+- Date/status filtering is performed locally over all retrieved records, so unsupported upstream filters cannot silently widen a monthly result.
+- Every source page is read twice and compared. Duplicate IDs, malformed responses, inaccessible organizations, changed pages and missing fields prevent a final total. This detects many source changes but cannot create a transactional snapshot of Zoho.
+- Reports run in bounded batches of API requests. Continue the same report ID until retrieval and verification finish. Totals are null while incomplete. Never add successive summaries.
+- Receipt evidence, all groups, exclusions, original source records, and validation errors can be retrieved from the encrypted snapshot for 24 hours.
+- `figures_are_complete` means retrieval and configured field validation succeeded. It does not mean finance reconciled the report.
 
-## How the pieces fit together
+## Financial definitions
 
-```
-ChatGPT  ──HTTPS──>  this server (hosted)  ──HTTPS──>  Zoho Books API
-         Bearer key                        OAuth token
-```
+`collections_report` calculates **gross recorded customer-payment receipts by payment date**, with inclusive start/end dates. It does not subtract refunds, bank charges or withholding, and it does not substitute invoice allocations or net bank deposits. Collection reports default to recorded base currency.
 
-ChatGPT can only talk to a server that is **on the public internet over HTTPS**. It cannot
-reach a program running on your laptop. So the work is: get credentials from Zoho → put this
-server on a host → paste the host's URL into ChatGPT.
+The general `list` summary supports explicit source metrics: count; payment/expense amount; invoice/bill total or current balance; and selected document totals. It is not a recognized-revenue report, a consolidated financial statement, or a reconstructed historical balance.
 
-Budget about 45 minutes the first time.
+For example, date-filtered invoice balances are today's source balances on invoices dated in that range. They are not what was outstanding at that historic month-end. Historical `as_of` balances are rejected. Aging requires current balances, explicit due dates and an explicit as_of equal to today's UTC date; missing information is an error.
 
----
+Net collections, recognized revenue, historic balances and intercompany eliminations require finance-approved rules or an appropriate Zoho source report. Unsupported interpretations are rejected/described explicitly rather than guessed.
 
-## Step 1 — Get your Zoho credentials
+## Tools
 
-### 1a. Create a Self Client
+Nine tools in read-only mode; thirteen when accounting writes are enabled:
 
-1. Go to **https://api-console.zoho.com** — but use the address that matches your region:
-   `.eu`, `.in`, `.com.au`, `.jp`, `.ca`, `.sa`, `.uk`.
-   *Not sure which?* Log into Zoho Books and look at the address bar. `books.zoho.eu` means
-   you use `api-console.zoho.eu` and region `eu`.
-2. Click **ADD CLIENT**.
-3. Choose **Self Client** (the last option — it's for server-side scripts with no website).
-4. Click **CREATE**, then **OK**.
-5. You now see **Client ID** and **Client Secret**. Copy both somewhere safe.
-
-### 1b. Generate a grant code
-
-1. Still in the API Console, open the **Generate Code** tab.
-2. **Scope**: `ZohoBooks.fullaccess.all`
-3. **Time Duration**: `10 minutes`
-4. **Scope Description**: `MCP` (anything works)
-5. Click **CREATE**, pick your organization, click **CREATE** again.
-6. Copy the code that appears. **It expires in 10 minutes** — go straight to the next step.
-
-> Prefer narrower access? Use this instead of `fullaccess.all`:
-> `ZohoBooks.contacts.ALL,ZohoBooks.invoices.ALL,ZohoBooks.estimates.ALL,ZohoBooks.salesorders.ALL,ZohoBooks.purchaseorders.ALL,ZohoBooks.expenses.ALL,ZohoBooks.customerpayments.ALL,ZohoBooks.settings.ALL,ZohoBooks.banking.READ,ZohoBooks.accountants.READ,ZohoBooks.users.READ`
-> Start with `fullaccess.all` to confirm everything works, then tighten it later — a missing
-> scope produces a confusing error and is the most common cause of a stuck setup.
-
-### 1c. Turn the code into a permanent refresh token
-
-Open PowerShell in this folder and run:
-
-```bash
-node get-refresh-token.js YOUR_CLIENT_ID YOUR_CLIENT_SECRET YOUR_GRANT_CODE com
-```
-
-Replace `com` with your region if different. It prints the four values you need.
-
----
-
-## Step 2 — Test it on your own machine
-
-```bash
-npm install
-```
-
-Copy `.env.example` to `.env` and fill in the values from Step 1c:
-
-```bash
-Copy-Item .env.example .env
-```
-
-Add a random `MCP_API_KEY` — generate one with:
-
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-
-Then verify your credentials actually work:
-
-```bash
-.\run-local.ps1 -Check
-```
-
-You should see your organizations listed. Copy the `organization_id` you want into
-`ZOHO_ORGANIZATION_ID` in `.env`. Then start the server:
-
-```bash
-.\run-local.ps1
-```
-
-Visit http://localhost:8080/health — you should see `{"status":"ok","tools":60,...}`.
-Press `Ctrl+C` to stop.
-
----
-
-## Step 3 — Put it on the internet
-
-Pick one. **Railway is the least fiddly** because it uploads this folder directly with no
-GitHub account needed.
-
-### Option A — Railway (recommended)
-
-```bash
-npm install -g @railway/cli
-```
-
-```bash
-railway login
-```
-
-```bash
-railway init
-```
-
-```bash
-railway up
-```
-
-Then in the Railway dashboard for your new project:
-
-1. **Variables** tab → add each line from your `.env` file
-   (`ZOHO_CLIENT_ID`, `ZOHO_CLIENT_SECRET`, `ZOHO_REFRESH_TOKEN`, `ZOHO_REGION`,
-   `ZOHO_ORGANIZATION_ID`, `MCP_API_KEY`).
-2. **Settings** → **Networking** → **Generate Domain**.
-3. You get a URL like `https://zoho-books-mcp-production.up.railway.app`.
-
-Check it works by opening that URL in a browser — you should see the "server is running" text.
-
-### Option B — Render
-
-Needs a GitHub account. Push this folder to a **private** GitHub repo, then at
-render.com: **New** → **Web Service** → connect the repo. `render.yaml` configures it
-automatically; you just fill in the Zoho values under **Environment**.
-
-### Option C — Quick temporary test with ngrok
-
-Only for trying it out — the URL dies when you close it and your PC must stay on.
-
-```bash
-npm install -g ngrok
-```
-
-Start the server locally (`.\run-local.ps1`), then in a second terminal:
-
-```bash
-ngrok http 8080
-```
-
-Use the `https://....ngrok-free.app` address it prints.
-
----
-
-## Step 4 — Add it to ChatGPT
-
-Requires a **Plus, Pro, Business, Enterprise or Edu** plan, on **chatgpt.com in a browser**
-(not the mobile app).
-
-1. **Settings** → **Apps & Connectors** → **Advanced settings** → turn on **Developer mode**.
-2. Go back to **Apps & Connectors** → **Create** / **Add custom connector**.
-3. Fill in:
-   - **Name**: `Zoho Books`
-   - **MCP Server URL**: your URL from Step 3 **with `/mcp` on the end** —
-     e.g. `https://zoho-books-mcp-production.up.railway.app/mcp`
-   - **Authentication**: choose **API Key** (sometimes labelled *Access token / API key*)
-   - **API Key**: paste your `MCP_API_KEY`
-4. Tick the box confirming you trust the connector, then **Create**.
-
-ChatGPT will connect and show the 60 tools. If it shows an error, see Troubleshooting below.
-
-### Using it
-
-In a new chat, open the **+** menu → **Developer mode** and enable the Zoho Books connector.
-Then just ask normally:
-
-- "List my 10 most recent unpaid invoices"
-- "Show me contact ABC Trading and their outstanding balance"
-- "Create a draft invoice for customer X for 3 days of consulting at 450 OMR/day"
-- "What did we spend on subcontractors last quarter?"
-
-ChatGPT will ask you to confirm before any tool runs the first time.
-
----
-
-## Troubleshooting
-
-| Symptom | Cause and fix |
+| Tool | Purpose |
 |---|---|
-| ChatGPT: "Could not connect" | URL is missing `/mcp` at the end, or the host is asleep — open the URL in a browser first to wake it. |
-| ChatGPT: 401 error | `MCP_API_KEY` in ChatGPT doesn't match the one set on the host. Re-copy it, no spaces. |
-| `invalid_client` | Wrong Client ID/Secret, **or wrong region** — a `.com` console client won't work against `.eu`. |
-| `invalid_code` | The grant code expired (10 min). Generate a new one and run `get-refresh-token.js` immediately. |
-| Tool returns "You are not authorized" | Missing scope. Regenerate the grant code with `ZohoBooks.fullaccess.all`. |
-| Tool returns HTTP 429 | Zoho rate limit. Wait a minute; use `per_page` to fetch less. |
-| Everything works, then breaks weeks later | Zoho keeps only the 20 newest refresh tokens per account. If you generated many, older ones get revoked. Generate a fresh one. |
+| ZohoBooks_collections_report | Gross payment-date receipts with explicit dates/scope |
+| ZohoBooks_list | One raw page or an explicit source-field summary |
+| ZohoBooks_continue_report | Resume retrieval and the verification pass |
+| ZohoBooks_get_report | Read summary/evidence/groups/errors/source records in pages or fragments |
+| ZohoBooks_reconcile_report | Compare every monetary record with a supplied finance reference |
+| ZohoBooks_get | Read one record in an explicit organization |
+| ZohoBooks_describe_module | Static field hints and available operations |
+| ZohoBooks_list_organizations | List accessible entities and currencies |
+| ZohoBooks_set_default_organization | Save a convenience preference, not implicit scope |
+| ZohoBooks_create/update/delete | Prepare a write preview only |
+| ZohoBooks_confirm_write | Execute a confirmed preview once |
 
-Server logs: `railway logs` on Railway, or the **Logs** tab on Render.
+The module registry covers the existing 24 modules. Static field hints are not a complete regional schema. Zoho still validates custom and region-specific rules. Unsupported response shapes stop with an error instead of being treated as empty.
 
----
+Example collections arguments:
+```json
+{
+  "organization_id": "ID_FROM_LIST_ORGANIZATIONS",
+  "date_start": "2026-08-01",
+  "date_end": "2026-08-31",
+  "currency_basis": "base"
+}
+```
 
-## Security notes
+Use `get_report` with `section: "evidence"` for individual receipts; follow `next_page`. If a single record/page exceeds the output limit, follow `next_offset` and concatenate the JSON text fragments before parsing. Every fragment is itself returned inside valid JSON.
 
-- **Your `MCP_API_KEY` is the only thing standing between the internet and your accounting
-  data.** The server refuses to start without one. Use a long random value; don't reuse it.
-- **This connector can delete invoices, contacts and payments.** Set `ZOHO_READ_ONLY=true`
-  to drop all 30 write tools and expose only the read tools. Recommended until you trust it.
-- The refresh token never expires. If it leaks, revoke it in the Zoho API Console
-  (**Self Client** → **Revoke**) and generate a new one.
-- Keep `.env` out of version control — `.gitignore` already covers it.
-- Treat data ChatGPT reads back from Zoho as information, not instructions. If a customer
-  note or invoice comment contains text telling the assistant to do something, that is not
-  a command from you.
+`reconcile_report` requires an actual reference label and rows containing organization_id, record_id, currency, and amount (a decimal string). It detects missing/extra receipts as well as amount/currency differences. Its status is `matches_supplied_reference` or `differs_from_supplied_reference`; it does not authenticate the reference or claim independent finance approval.
 
----
+## Setup
 
-## Reference
+1. Install Node 22+ and PostgreSQL.
+2. Create a Zoho **Server-based Application**, with the redirect URI exactly `PUBLIC_URL/zoho/callback`.
+3. Copy `.env.example` to `.env` and fill in the application credentials, public HTTPS origin, database URL, domain allowlist and encryption key.
+4. Generate a persistent key once:
+   `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+5. Run `npm ci`, then `node --env-file=.env server.js`.
+6. Configure a compatible MCP client for the public `/mcp` URL using OAuth with dynamic client registration. Each user links their own Zoho account.
+7. Check `/health` for version, build ID, read-only status and loaded-tool count. Health checks verify PostgreSQL, not live Zoho permissions.
 
-### Environment variables
+The previous API-key/Self-Client instructions do not apply. `MCP_API_KEY`, `ZOHO_REFRESH_TOKEN` and `ZOHO_ORGANIZATION_ID` are not used.
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `ZOHO_CLIENT_ID` | yes | From the Zoho API Console Self Client |
-| `ZOHO_CLIENT_SECRET` | yes | Same place |
-| `ZOHO_REFRESH_TOKEN` | yes | From `get-refresh-token.js` |
-| `MCP_API_KEY` | yes | Shared secret ChatGPT sends as `Authorization: Bearer …` |
-| `ZOHO_REGION` | no | `com` (default), `eu`, `in`, `au`, `jp`, `ca`, `sa`, `uk` |
-| `ZOHO_ORGANIZATION_ID` | no | Default org, so tools don't need it passed each call |
-| `ZOHO_READ_ONLY` | no | `true` hides all create/update/delete tools |
-| `MAX_RESPONSE_CHARS` | no | Truncate large responses (default 60000) |
-| `PORT` | no | Set automatically by hosts |
+Read-only is the default. It requests explicit Zoho read scopes. Existing connections authorized with full access must be revoked/reconnected if their upstream permissions should also be narrowed. Set `ZOHO_READ_ONLY=false` to expose the write workflow and reconnect for write scopes. A missing scope produces an error; it never produces a valid zero report.
 
-### Files
+Zoho documents custom-module record access under custommodules.ALL, so those records are unavailable in strict read-only mode. Custom-module definitions remain readable through settings.READ. No broader scope is silently requested.
 
-| File | Purpose |
-|---|---|
-| `server.js` | HTTP + MCP transport + auth |
-| `tools.js` | The 60 tool definitions |
-| `zoho.js` | OAuth token refresh + Zoho API calls |
-| `check.js` | `npm run check` — credential test, lists organizations |
-| `get-refresh-token.js` | One-time grant code → refresh token |
-| `run-local.ps1` | Loads `.env` and starts the server on Windows |
+## Safe writes
 
-### Tools
+Each create/update/delete request supplies explicit organization and a UUID idempotency_key. It produces a ten-minute preview containing the target, current record and proposed changes. Show this to the human before calling confirm_write with user_confirmed:true.
 
-**Read (30)** — `get_contact` `get_custom_module` `get_custom_module_record`
-`get_customer_payment` `get_estimate` `get_expense` `get_invoice` `get_item`
-`get_organization` `get_purchase_order` `get_sales_order` `get_tax` `get_user`
-`list_bank_accounts` `list_chart_of_accounts` `list_contacts` `list_currencies`
-`list_custom_fields` `list_custom_module_records` `list_custom_modules`
-`list_customer_payments` `list_estimates` `list_expenses` `list_invoices` `list_items`
-`list_organizations` `list_purchase_orders` `list_sales_orders` `list_taxes` `list_users`
+The server atomically claims an operation once, rechecks access and compares the current record with the preview. If Zoho cannot provide the current record, update/delete cannot proceed safely. A network interruption after dispatch produces an unknown outcome; inspect Zoho and the same operation ID before attempting any fresh operation. Confirming the same operation again never dispatches it again.
 
-**Create (12)** — `create_contact` `create_custom_field` `create_custom_module`
-`create_custom_module_record` `create_customer_payment` `create_estimate` `create_expense`
-`create_invoice` `create_item` `create_purchase_order` `create_sales_order` `create_tax`
+This is not a database transaction with Zoho: a remote edit can still happen between the final read and write. The server cannot independently prove that a human approved an assistant's boolean; the client must enforce the actual confirmation UI. Preview records and write outcomes are encrypted in PostgreSQL. Completed/unknown operation keys are retained to preserve duplicate protection; do not delete them casually.
 
-**Update (10)** — `update_contact` `update_custom_field` `update_custom_module`
-`update_customer_payment` `update_estimate` `update_expense` `update_invoice` `update_item`
-`update_purchase_order` `update_sales_order`
+## Security and upgrades
 
-**Delete (8)** — `delete_contact` `delete_customer_payment` `delete_estimate`
-`delete_expense` `delete_invoice` `delete_item` `delete_purchase_order` `delete_sales_order`
+Required `TOKEN_ENCRYPTION_KEY`: 64 hexadecimal characters, shared by all replicas. Back it up securely and keep it stable. On startup, migration transactionally encrypts existing plaintext Zoho refresh tokens and client secrets and hashes existing MCP tokens. Existing nonexpiring refresh tokens get a 30-day expiry. Refresh rotation and issuing replacements are transactional. Revocation removes the user's token grant for that MCP client.
 
-All names are prefixed `ZohoBooks_`.
+Back up the database before the first v3 deployment. A migration locks credential tables briefly. After migration the old version cannot read encrypted credentials; rollback requires the pre-upgrade backup. Losing the encryption key makes stored credentials and reports unreadable. Key rotation requires an explicit decrypt/re-encrypt migration; replacing the environment variable alone is not rotation.
 
-Every `list_` tool accepts `page`, `per_page`, `sort_column`, `sort_order`, `search_text`,
-`filter_by`, and a free-form `params` object for any other Zoho query parameter. Every tool
-accepts an optional `organization_id` to override the default.
+Only approved Zoho HTTPS origins are accepted; redirects are rejected. Managed PostgreSQL certificate verification is enabled. Supply `DATABASE_CA_PEM` if your provider uses a private CA. `DATABASE_SSL=false` is only appropriate for the private/local PostgreSQL connection. Use URL-encoded database passwords or the generated hexadecimal password in the Compose template.
+
+Reports expire after 24 hours and hourly cleanup removes expired snapshots and OAuth artifacts. Application logs omit tokens and report contents. Restrict proxy log access; OAuth callback query strings should not be retained.
+
+## Limits and operation
+
+- HTTP reads: 20-second attempt timeout, up to three attempts for transient failures. Writes are never automatically retried.
+- A report call performs up to ten page requests. Calls continue from encrypted state and use optimistic concurrency to reject conflicting updates.
+- MAX_REPORT_RECORDS defaults to 100,000 per snapshot. Hitting it blocks a final total. Because date filtering is local, a shorter requested date range does not reduce upstream scanning. For organizations beyond this limit use a native export or raise the bound after capacity review.
+- MAX_API_BYTES defaults to 8 MB per upstream response. MAX_RESPONSE_CHARS defaults to 60,000; oversized output is stored and read through get_report.
+- Two concurrent MCP requests per user per process. For multiple replicas, put shared rate limits at the proxy. Stable encryption key and PostgreSQL are shared.
+- Set BUILD_ID to the deployed commit so a finance incident can be tied to its exact implementation.
+
+## Verification
+
+`npm test` runs unit tests; the PostgreSQL integration test runs when TEST_DATABASE_URL names a disposable database. Never point that variable at a real application database. Integration tests use synthetic users, OAuth credentials and Zoho responses; they do not access live Zoho.
+
+`npm audit` checks dependencies. CI runs unit/integration tests with PostgreSQL 16. See FIXES.md for issue coverage and acceptance work still requiring finance evidence.
+
+For the August incident, obtain the actual finance export, original tool inputs/output and deployed build. Neither screenshot is an approved expected result.

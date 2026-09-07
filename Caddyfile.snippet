@@ -17,6 +17,15 @@ books-mcp.via-int.com {
 
 	log {
 		output file /var/log/caddy/books-mcp.log
-		format console
+		format filter {
+			request>uri query {
+				delete code
+				delete state
+				delete client_secret
+			}
+			request>headers>Authorization delete
+			request>headers>Cookie delete
+			wrap json
+		}
 	}
 }

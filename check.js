@@ -9,7 +9,7 @@ console.log(`Public URL        : ${process.env.PUBLIC_URL || "(not set)"}`);
 console.log(`Zoho callback URI : ${(process.env.PUBLIC_URL || "").replace(/\/+$/, "")}/zoho/callback`);
 console.log(`Allowed domains   : ${process.env.ALLOWED_EMAIL_DOMAINS || "(any)"}\n`);
 
-const missing = ["ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "PUBLIC_URL", "DATABASE_URL"].filter(
+const missing = ["ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "PUBLIC_URL", "DATABASE_URL", "TOKEN_ENCRYPTION_KEY"].filter(
   (k) => !process.env[k]
 );
 if (missing.length) {
@@ -18,8 +18,8 @@ if (missing.length) {
 }
 
 try {
-  await db.migrate();
-  console.log("Database          : connected, schema ready\n");
+  await db.health();
+  console.log("Database          : connected (read-only check; startup performs migrations)\n");
 
   const users = await db.listUsers();
   if (!users.length) {

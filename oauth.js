@@ -11,11 +11,14 @@
 
 import { randomBytes } from "node:crypto";
 import * as db from "./db.js";
+import { zohoOrigin } from "./security.js";
+import { InvalidGrantError, InvalidTokenError, InvalidScopeError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import {
   zohoAuthorizeUrl,
   exchangeZohoCode,
   fetchZohoUserInfo,
   zohoApiRaw,
+  invalidateTokenCache,
 } from "./zoho.js";
 
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -77,6 +80,8 @@ export class ZohoOAuthProvider {
 
   /** Step 1: park ChatGPT's request and bounce the human to Zoho. */
   async authorize(client, params, res) {
+    if (params.resource && String(params.resource) !== this.publicUrl + "/mcp") throw new InvalidGrantError("Invalid resource");
+    if (params.scopes?.some(scope => scope !== "zoho_books")) throw new InvalidScopeError("Unsupported scope");
     const stateId = randomToken();
     await db.createPendingAuth(
       stateId,
@@ -86,7 +91,7 @@ export class ZohoOAuthProvider {
         codeChallenge: params.codeChallenge,
         state: params.state ?? null,
         scopes: params.scopes ?? [],
-        resource: params.resource ? String(params.resource) : null,
+        resource: this.publicUrl + "/mcp",
       },
       PENDING_TTL_MS
     );
@@ -96,48 +101,36 @@ export class ZohoOAuthProvider {
 
   async challengeForAuthorizationCode(client, authorizationCode) {
     const entry = await db.peekCode(authorizationCode);
-    if (!entry || entry.client_id !== client.client_id) throw new Error("Invalid authorization code");
+    if (!entry || entry.client_id !== client.client_id) throw new InvalidGrantError("Invalid authorization code");
     return entry.params.codeChallenge;
   }
 
-  async exchangeAuthorizationCode(client, authorizationCode) {
-    const entry = await db.consumeCode(authorizationCode);
-    if (!entry || entry.client_id !== client.client_id) throw new Error("Invalid authorization code");
-    return this._issue(client.client_id, entry.user_id, entry.params.scopes, entry.params.resource);
+  async exchangeAuthorizationCode(client, authorizationCode, _verifier, redirectUri, resource) {
+    const pending = await db.peekCode(authorizationCode);
+    if (!pending || pending.client_id !== client.client_id || (redirectUri && redirectUri !== pending.params.redirectUri) ||
+        (resource && String(resource) !== pending.params.resource)) throw new InvalidGrantError("Code binding mismatch");
+    return this._issue(client.client_id, pending.user_id, pending.params.scopes, pending.params.resource, { code: authorizationCode });
   }
 
-  async exchangeRefreshToken(client, refreshToken, scopes) {
-    const row = await db.getToken(refreshToken);
+  async exchangeRefreshToken(client, refreshToken, scopes, resource) {
+    const existing = await db.getToken(refreshToken);
+    if (resource && String(resource) !== existing?.resource) throw new InvalidGrantError("Resource mismatch");
+    if (scopes?.some(scope => !existing?.scopes?.includes(scope))) throw new InvalidScopeError("Cannot expand scopes");
+    const row = existing;
     if (!row || row.kind !== "refresh" || row.client_id !== client.client_id) {
-      throw new Error("Invalid refresh token");
+      throw new InvalidGrantError("Invalid refresh token");
     }
-    return this._issue(client.client_id, row.user_id, scopes ?? row.scopes, row.resource, refreshToken);
+    return this._issue(client.client_id, row.user_id, scopes ?? row.scopes, row.resource, { oldRefresh: refreshToken });
   }
 
-  async _issue(clientId, userId, scopes, resource, existingRefresh) {
+  async _issue(clientId, userId, scopes, resource, consumed = {}) {
     const access_token = randomToken();
-    await db.saveToken({
-      token: access_token,
-      kind: "access",
-      clientId,
-      userId,
-      scopes: scopes ?? [],
-      resource,
-      ttlMs: ACCESS_TTL_S * 1000,
-    });
-
-    let refresh_token = existingRefresh;
-    if (!refresh_token) {
-      refresh_token = randomToken();
-      await db.saveToken({
-        token: refresh_token,
-        kind: "refresh",
-        clientId,
-        userId,
-        scopes: scopes ?? [],
-        resource,
-        ttlMs: null,
-      });
+    const refresh_token = randomToken();
+    try {
+      await db.issueTokenPair({ accessToken: access_token, refreshToken: refresh_token, clientId, userId, scopes, resource, ...consumed });
+    } catch (error) {
+      if (error.message === 'Credential already used or expired') throw new InvalidGrantError(error.message);
+      throw error;
     }
 
     return {
@@ -152,7 +145,10 @@ export class ZohoOAuthProvider {
   /** Identity for every downstream tool call lives in `extra.userId`. */
   async verifyAccessToken(token) {
     const row = await db.getToken(token);
-    if (!row || row.kind !== "access") throw new Error("Invalid or expired token");
+    if (!row || row.kind !== "access") throw new InvalidTokenError("Invalid or expired token");
+    if (row.resource && row.resource !== this.publicUrl + "/mcp") throw new InvalidTokenError("Wrong token audience");
+    const user = await db.getUser(row.user_id);
+    if (!user || !emailAllowed(user.email)) throw new InvalidTokenError("Account access is no longer permitted");
     return {
       token,
       clientId: row.client_id,
@@ -163,8 +159,8 @@ export class ZohoOAuthProvider {
     };
   }
 
-  async revokeToken(_client, request) {
-    await db.deleteToken(request.token);
+  async revokeToken(client, request) {
+    await db.revokeGrant(request.token, client.client_id);
   }
 }
 
@@ -178,12 +174,12 @@ export function zohoCallbackHandler(provider) {
 
     try {
       const { code, state, error } = req.query;
-      const accountsServer = req.query["accounts-server"] || "https://accounts.zoho.com";
+      const accountsServer = zohoOrigin(req.query["accounts-server"] || process.env.ZOHO_AUTH_BASE || "https://accounts.zoho.com");
 
       if (error) {
         return send(400, page({ title: "Zoho declined the request", message: esc(String(error)) }));
       }
-      if (!code || !state) {
+      if (typeof code !== "string" || typeof state !== "string" || !code || !state) {
         return send(400, page({ title: "Malformed callback", message: "Zoho did not return a code." }));
       }
 
@@ -222,7 +218,7 @@ export function zohoCallbackHandler(provider) {
         );
       }
 
-      const apiDomain = tokens.api_domain || "https://www.zohoapis.com";
+      const apiDomain = zohoOrigin(tokens.api_domain, "api");
 
       // Pick a sensible default organization so tools work without one being passed.
       let defaultOrgId = null;
@@ -249,6 +245,7 @@ export function zohoCallbackHandler(provider) {
         apiDomain,
         defaultOrgId,
       });
+      invalidateTokenCache(user.id);
 
       console.log(`[oauth] linked ${info.email ?? info.zuid} (org ${defaultOrgId ?? "none"})`);
 
@@ -261,8 +258,8 @@ export function zohoCallbackHandler(provider) {
       if (pending.params.state) back.searchParams.set("state", pending.params.state);
       return res.redirect(302, back.href);
     } catch (err) {
-      console.error("[oauth] callback failed:", err);
-      return send(500, page({ title: "Could not complete sign-in", message: esc(err.message) }));
+      console.error("[oauth] callback failed", { type: err.name });
+      return send(500, page({ title: "Could not complete sign-in", message: "Sign-in could not be verified. Check the registered Zoho region and redirect URI, then reconnect." }));
     }
   };
 }

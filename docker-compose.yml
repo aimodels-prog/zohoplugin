@@ -30,7 +30,10 @@ services:
     # Separate from via-postgres on purpose: your existing database is never touched.
 
   app:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_ID: ${BUILD_ID:-development}
     container_name: zoho-mcp-app
     restart: unless-stopped
     depends_on:
@@ -43,9 +46,13 @@ services:
       PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
       ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID:?set ZOHO_CLIENT_ID in .env}
       ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET:?set ZOHO_CLIENT_SECRET in .env}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?set TOKEN_ENCRYPTION_KEY in .env}
       ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:-}
-      ZOHO_READ_ONLY: ${ZOHO_READ_ONLY:-false}
+      ZOHO_READ_ONLY: ${ZOHO_READ_ONLY:-true}
       MAX_RESPONSE_CHARS: ${MAX_RESPONSE_CHARS:-60000}
+      MAX_REPORT_RECORDS: ${MAX_REPORT_RECORDS:-100000}
+      ZOHO_AUTH_BASE: ${ZOHO_AUTH_BASE:-https://accounts.zoho.com}
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
     networks:
       - internal   # to reach postgres
       - via_proxy  # so via-caddy can reach this container

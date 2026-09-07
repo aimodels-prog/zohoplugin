@@ -1,8 +1,11 @@
 FROM node:22-alpine
 WORKDIR /app
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
 COPY . .
+ARG BUILD_ID=development
+ENV BUILD_ID=$BUILD_ID
 ENV PORT=8080
 EXPOSE 8080
+USER node
 CMD ["node", "server.js"]
