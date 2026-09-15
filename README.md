@@ -138,3 +138,25 @@ The original two-request foreground budget produced 400-invoice checkpoints even
 Completed grouped reports include their first 50 verified groups, plus a pointer to page 2 when needed. All groups are calculated from the entire verified population before output pagination. Monetary customer/vendor groups sort by exact amount within organization/currency. Incomplete `get_report` group responses have `data: null`, not an empty ranking. Counts carry a warning that no outstanding amounts were calculated; summary/grouping requests require an explicit metric. Use `receivables_report` for customer outstanding balances and reserve invoice summaries for explicit invoice-only questions.
 
 Graceful shutdown drains active report jobs briefly and releases only this process's remaining leases. Snapshot writes require the current lease and revision, so late results cannot overwrite recovered work. Abrupt process death still uses the existing lease-expiry recovery. Rate-limit delays remain enforced.
+
+## Existing ChatGPT tool snapshots (v3.3.1)
+
+The public MCP discovery response includes `ZohoBooks_receivables_report` and `ZohoBooks_list.inputSchema.properties.metric`. A workspace's approved ChatGPT tool snapshot can still omit them. Checking the live endpoint alone does not validate the definitions enabled in that workspace. OpenAI documents that approved tool definitions do not update automatically; refreshed new actions may remain disabled until the admin enables/publishes them. See [OpenAI's workspace app update documentation](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
+
+The existing `ZohoBooks_list` tool now provides a reporting compatibility path through the original `params` object. This does not enable other disabled tools or accounting writes. It implements the same validated read calculations using a tool already available to the client:
+
+```json
+{"module":"invoices","organization_id":"OMAN_ID","group_by":"customer","params":{"metric":"balance","currency_basis":"transaction"}}
+```
+
+For native current customer receivables, without requiring the dedicated tool name:
+
+```json
+{"module":"contacts","organization_id":"OMAN_ID","params":{"report_type":"receivables","currency_basis":"base"}}
+```
+
+For gross receipts use `module: customer_payments`, `params.report_type: collections`, and explicit `params.date_start` / `params.date_end`. These routes do not guess metrics or silently replace invoice-only balances with customer balances. Nested and top-level values must agree; unknown parameters, extra scope overrides and unsupported financial criteria fail validation. Supplying an explicit metric implies a complete summary.
+
+Continuations and output pagination from list reports refer back to `ZohoBooks_list` with `params.report_id` and optional `params.section` / `params.offset`; `page` and `per_page` remain existing top-level fields. The original report scope and owner are rechecked. Oversized raw-response pointers and text fragments use the same existing tool, too. This supports the original reporting input subset even when newer continuation and evidence tools have not been published to the workspace.
+
+The tests use an older client contract with no top-level metric/currency basis and only the existing list tool for the entire report workflow. This is separate from verifying an actual ChatGPT workspace configuration, which the server cannot change.

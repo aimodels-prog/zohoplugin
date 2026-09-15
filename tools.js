@@ -13,6 +13,7 @@ import { createDownloadTicket } from "./report-export.js";
 import { emailAllowed } from "./oauth.js";
 import { reportResponse } from "./report-response.js";
 import { setTimeout as delay } from "node:timers/promises";
+import { listParamsSchema, normalizeListArgs, compatibleListResult } from "./list-compat.js";
 
 const tools = [];
 const add = (name, description, schema, run, write = false) => {
@@ -55,7 +56,7 @@ async function checkOrg(userId, organizationId) {
 }
 const summaryArgs = {
   metric: z.enum(["count", "amount", "total", "balance"]).optional().describe("Required for summaries/grouping. count counts documents, not money. Use receivables_report for customer outstanding ranking."),
-  currency_basis: z.enum(["transaction", "base"]).default("transaction"),
+  currency_basis: z.enum(["transaction", "base"]).optional().describe("Source-field reports default to transaction currency; dedicated receivables/collections default to base."),
   date_start: date.optional(), date_end: date.optional(),
   statuses: z.array(z.string().min(1)).min(1).optional(),
   search_text: z.string().min(1).max(200).optional().describe("Local case-insensitive substring match on names, reference/document numbers and description; implies report retrieval"),
@@ -175,18 +176,54 @@ add("receivables_report",
   (args, userId) => report({ ...args, module: "contacts", metric: "outstanding_receivable_amount", group_by: "customer" }, userId, "receivables"));
 
 add("list",
-  "List one explicit organization's page, or build a validated source-field summary using summarize/group_by. A raw page is not a total. For collections use collections_report; for current customer outstanding balances use receivables_report. Source total is not recognized revenue; balance is current, not a historical cutoff balance. Summaries allow only typed local date/status filters and explicit metric; unsupported financial interpretations must use a finance-approved source report.",
+  "List an explicit organization's page or build a complete validated report. Older ChatGPT tool snapshots can supply metric, currency_basis and validated filters inside params. For customer outstanding ranking use module: contacts with params: {report_type: receivables}; for invoice-only balances use module: invoices, summarize: true, params: {metric: balance}. Continue or read a saved report through this SAME tool using params.report_id and optional params.section. Unknown filters and conflicting inputs are rejected. A raw page is not a total. Source total is not recognized revenue; balances are current, not historical.",
   { ...moduleArg, ...scopeArgs, ...summaryArgs, module_api_name: id.optional(), summarize: z.boolean().optional(),
     page: z.coerce.number().int().min(1).default(1), per_page: z.coerce.number().int().min(1).max(200).default(100),
     entity: id.optional(),
-    params: z.record(z.unknown()).refine(p => Object.keys(p).length === 0, "Arbitrary filters are not validated; use typed report dates/statuses").optional(),
+    params: listParamsSchema.optional().describe("Validated report options for existing clients. Supports metric, currency_basis, report_type, report_id, section, offset, dates and explicit local filters. Never arbitrary Zoho query parameters."),
   },
-  async (args, userId) => {
-    if (args.summarize || args.group_by || args.all_organizations || args.organization_ids || args.search_text || args.customer_id || args.vendor_id) {
+  async (input, userId) => {
+    const args=normalizeListArgs(input);
+    return compatibleListResult(await runList(args,userId),args);
+  });
+async function runList(args,userId) {
+    if(args.report_id) {
+      const stored=await db.getReport(args.report_id,userId);
+      if(!stored)return fail("Report not found or expired");
+      if(stored.payload.kind!=="raw") {
+        if(stored.payload.spec.module!==args.module)return fail("Saved report module differs from the requested module");
+        if(args.organization_id||args.organization_ids||args.all_organizations) {
+          const available=await organizations(userId);
+          selectOrganizations(available,args);
+          const chosen=selectOrganizations(available,args.all_organizations?{organization_ids:expectedOrganizations()}:args).map(o=>String(o.organization_id)).sort();
+          if(fingerprint(chosen)!==fingerprint(stored.payload.organizations.map(o=>o.id).sort()))return fail("Saved report scope differs from the requested organizations");
+        }
+      }
+      if(args.metric||args.group_by||args.date_start||args.date_end||args.as_of||args.statuses||args.customer_id||args.vendor_id||args.search_text||args.summarize||args.entity||args.module_api_name||args.currency_basis)return fail("Saved report criteria cannot be changed");
+      const tool=tools.find(t=>t.name==='ZohoBooks_'+(args.section?'get_report':'continue_report'));
+      const query={report_id:args.report_id,...(args.section&&{section:args.section,page:args.page,per_page:args.per_page,offset:args.offset})};
+      return tool.run(z.object(tool.schema).strict().parse(query),userId);
+    }
+    if(args.report_type==='receivables') {
+      if(args.module!=='contacts')return fail("Customer receivables require module: contacts; invoice-only balances require metric: balance without report_type: receivables");
+      if(args.metric||args.date_start||args.date_end||args.as_of||args.statuses||args.vendor_id||args.search_text||args.entity||args.module_api_name||(args.group_by&&args.group_by!=='customer'))return fail("Unsupported customer receivables criteria; current balances cannot apply invoice dates, statuses or another metric");
+      const tool=tools.find(t=>t.name==='ZohoBooks_receivables_report');
+      const query={organization_id:args.organization_id,organization_ids:args.organization_ids,all_organizations:args.all_organizations,currency_basis:args.currency_basis,customer_id:args.customer_id};
+      return tool.run(z.object(tool.schema).strict().parse(query),userId);
+    }
+    if(args.report_type==='collections') {
+      if(args.module!=='customer_payments'||args.metric&&args.metric!=='amount'||args.as_of||args.statuses||args.customer_id||args.vendor_id||args.search_text||args.entity||args.module_api_name)return fail("Collections require customer_payments and inclusive receipt dates; unsupported criteria cannot be ignored");
+      const tool=tools.find(t=>t.name==='ZohoBooks_collections_report');
+      return tool.run(z.object(tool.schema).strict().parse({organization_id:args.organization_id,organization_ids:args.organization_ids,all_organizations:args.all_organizations,date_start:args.date_start,date_end:args.date_end,currency_basis:args.currency_basis,group_by:args.group_by}),userId);
+    }
+    if(args.report_type==='source_field')args.summarize=true;
+    if (args.metric || args.summarize || args.group_by || args.all_organizations || args.organization_ids || args.search_text || args.customer_id || args.vendor_id) {
       if (args.entity || args.module === "custom_fields") return fail("Custom field definitions require a raw list with entity; financial summaries are unsupported");
+      if(!args.metric)return {isError:true,content:[{type:'text',text:JSON.stringify({code:'report_metric_required',message:'No report was calculated. Supply the metric in params on this existing tool. count counts documents; balance sums current invoice balances. Customer receivables are available using module contacts and params.report_type receivables.',
+        supported_params:{invoice_balance:{metric:'balance'},document_count:{metric:'count'},customer_receivables:{module:'contacts',params:{report_type:'receivables'}}}})}]};
       return report(args, userId);
     }
-    if (args.date_start || args.date_end || args.statuses) return fail("Use summarize:true for validated date/status filtering");
+    if (args.date_start || args.date_end || args.statuses || args.as_of || args.currency_basis) return fail("Use an explicit metric or params.report_type for validated financial dates, currencies and status filtering");
     const m = resolve(args, "list");
     if (!args.organization_id) return fail("Select an explicit organization_id; list_organizations shows available entities");
     await checkOrg(userId, args.organization_id);
@@ -199,7 +236,7 @@ add("list",
       returned_record_count: rows.length, has_more_page: r.data.page_context?.has_more_page ?? null,
       figures_are_complete: false, note: "Raw page only; never calculate report totals from this page.",
       records: rows }, userId);
-  });
+}
 
 add("continue_report", "Wait for a stored report to finish retrieving and verifying all pages, using its fixed scope. Call automatically when status is processing; do not ask the user to continue. Bounded wait returns a next_action if still processing. Never add successive summaries. Completed reports include the first 50 groups and a pointer to remaining groups.",
   { report_id: z.string().uuid() }, async ({ report_id }, userId) => {
@@ -272,7 +309,7 @@ add("reconcile_report", "Compare every included monetary record with an actual u
 
 add("get_report", "Read a stored report summary, every group, receipt evidence, exclusions, validation errors, or original source records. Retention defaults to 30 days; summary reports retained_until. Pages and text fragments preserve all stored data; use next_page/next_offset until absent. Stored reports are historical retrievals, not fresh Zoho reads.",
   { report_id: z.string().uuid(), section: z.enum(["summary", "evidence", "groups", "exclusions", "validation_errors", "source_records", "reconciliation_differences", "raw"]).default("summary"),
-    page: z.coerce.number().int().min(1).default(1), per_page: z.coerce.number().int().min(1).max(100).default(50),
+    page: z.coerce.number().int().min(1).default(1), per_page: z.coerce.number().int().min(1).max(200).default(50),
     offset: z.coerce.number().int().min(0).default(0) },
   async ({ report_id, section, page, per_page, offset }, userId) => {
     let stored = await db.getReport(report_id, userId);

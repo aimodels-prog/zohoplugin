@@ -95,16 +95,17 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     const ranked = payload(await call("get_report", { report_id: receivables.report_id, section: "groups" }));
     assert.equal(ranked.data[0].group_id, "c1");
     assert.equal(ranked.data[0].rank_in_organization_currency, 1);
-    await assert.rejects(call('list',{module:'invoices',organization_id:'om',summarize:true,group_by:'customer'}),/explicit metric/);
+    const missingMetric=await call('list',{module:'invoices',organization_id:'om',summarize:true,group_by:'customer'});
+    assert.equal(missingMetric.isError,true);assert.equal(payload(missingMetric).code,'report_metric_required');
     const fullInvoices=payload(await call('list',{module:'invoices',organization_id:'om',summarize:true,group_by:'customer',metric:'balance',currency_basis:'base'}));
     assert.equal(fullInvoices.status,'complete');assert.equal(fullInvoices.record_count,608);assert.equal(invoiceReads,8);
     assert.equal(fullInvoices.organizations[0].pages,4);assert.equal(fullInvoices.organizations[0].verification_pages,4);
     assert.equal(fullInvoices.totals[0].amount.exact,'1607');assert.equal(fullInvoices.groups[0].group_id,'late-winner');
     assert.equal(fullInvoices.groups[0].rank_in_organization_currency,1);assert.equal(fullInvoices.groups_complete,false);
-    const moreGroups=payload(await call('get_report',fullInvoices.next_action.arguments));
+    const moreGroups=payload(await call(fullInvoices.next_action.tool.replace('ZohoBooks_',''),fullInvoices.next_action.arguments));
     assert.equal(moreGroups.data.length,11);assert.equal(moreGroups.total_records,61);assert.equal(moreGroups.figures_are_complete,true);
     const countOnly=payload(await call('list',{module:'invoices',organization_id:'om',summarize:true,group_by:'customer',metric:'count'}));
-    assert.equal(countOnly.amounts_calculated,false);assert.equal(countOnly.tool_for_customer_receivables.tool,'ZohoBooks_receivables_report');
+    assert.equal(countOnly.amounts_calculated,false);assert.equal(countOnly.tool_for_customer_receivables.tool,'ZohoBooks_list');
     await assert.rejects(call("receivables_report", { organization_id: "om", as_of: "2026-08-31" }));
     assert.equal(await db.getReport(summary.report_id, "other-user"), null);
     assert.equal(payload(await call("get_report", { report_id: summary.report_id, section: "evidence" })).data.length, 2);
@@ -164,6 +165,9 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     const listed = await mcp.json();
     assert.ok(listed.result.tools.some(t => t.name === "ZohoBooks_collections_report"));
     assert.ok(listed.result.tools.some(t => t.name === "ZohoBooks_receivables_report"));
+    const listSchema=listed.result.tools.find(t=>t.name==='ZohoBooks_list').inputSchema;
+    assert.ok(listSchema.properties.metric.enum.includes('balance'));
+    assert.ok(listSchema.properties.params.properties.metric.enum.includes('balance'));
     const invalidCall = await originalFetch(origin + "/mcp", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer " + auth.access_token },
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "ZohoBooks_collections_report", arguments: { organization_id: "om", date_start: "2026-08-01", date_end: "2026-08-31", filter_by: "ignored-filter" } } }) });
     const invalidResult = await invalidCall.json();
@@ -173,6 +177,39 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     const invoiceMcpResult=payload((await invoiceMcp.json()).result);
     assert.equal(invoiceMcpResult.status,'complete');assert.equal(invoiceMcpResult.record_count,608);
     assert.equal(invoiceMcpResult.groups[0].group_id,'late-winner');
+    // Replay the original client's reporting input subset: params exists, but
+    // metric/currency_basis and the newer tool names are not available to it.
+    const oldListSchema=z.object({module:z.enum(['invoices','contacts','customer_payments']),organization_id:z.string().optional(),organization_ids:z.array(z.string()).optional(),all_organizations:z.boolean().optional(),summarize:z.boolean().optional(),group_by:z.enum(['customer','vendor','month','status','currency','aging']).optional(),page:z.number().int().min(1).optional(),per_page:z.number().int().min(1).max(200).optional(),params:z.record(z.unknown()).optional()}).strict();
+    assert.throws(()=>oldListSchema.parse({module:'invoices',metric:'balance'}));
+    const legacyCall=async args=>{
+      oldListSchema.parse(args);
+      const r=await originalFetch(origin+'/mcp',{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',Authorization:'Bearer '+auth.access_token},body:JSON.stringify({jsonrpc:'2.0',id:5,method:'tools/call',params:{name:'ZohoBooks_list',arguments:args}})});
+      const body=await r.json();assert.equal(body.result.isError,false,JSON.stringify(body));return payload(body.result);
+    };
+    const legacyInvoices=await legacyCall({module:'invoices',organization_id:'om',group_by:'customer',params:{metric:'balance',currency_basis:'base'}});
+    assert.equal(legacyInvoices.record_count,608);assert.equal(legacyInvoices.totals[0].amount.exact,'1607');
+    assert.equal(legacyInvoices.next_action.tool,'ZohoBooks_list');
+    const legacyGroups=await legacyCall(legacyInvoices.next_action.arguments);
+    assert.equal(legacyGroups.data.length,11);assert.equal(legacyGroups.data[0].rank_in_organization_currency,51);
+    const legacyReceivables=await legacyCall({module:'contacts',organization_id:'om',params:{report_type:'receivables',currency_basis:'base'}});
+    assert.equal(legacyReceivables.totals[0].amount.exact,'123.456');assert.equal(legacyReceivables.specification.kind,'receivables');
+    assert.equal(legacyReceivables.specification.currency_basis,'base');
+    const legacyCollections=await legacyCall({module:'customer_payments',organization_id:'om',params:{report_type:'collections',date_start:'2026-08-01',date_end:'2026-08-31'}});
+    assert.equal(legacyCollections.totals[0].amount.exact,'81.357');
+    process.env.REPORT_WAIT_SECONDS='0';
+    const legacyPending=await legacyCall({module:'contacts',organization_id:'om',params:{report_type:'receivables'}});
+    delete process.env.REPORT_WAIT_SECONDS;
+    assert.equal(legacyPending.status,'processing');assert.equal(legacyPending.next_action.tool,'ZohoBooks_list');
+    const legacyComplete=await legacyCall(legacyPending.next_action.arguments);
+    assert.equal(legacyComplete.status,'complete');assert.equal(legacyComplete.report_id,legacyPending.report_id);
+    assert.equal((await call('list',{module:'contacts',params:{report_id:legacyPending.report_id}},'other-user')).isError,true);
+    assert.equal((await call('list',{module:'invoices',params:{report_id:legacyPending.report_id}})).isError,true);
+    await assert.rejects(call('list',{module:'contacts',organization_id:'different',params:{report_id:legacyPending.report_id}}),/accessible/);
+    await assert.rejects(call('list',{module:'invoices',organization_id:'om',metric:'count',params:{metric:'balance'}}),/Conflicting/);
+    await assert.rejects(call('list',{module:'invoices',organization_id:'om',params:{organization_id:'other'}}));
+    await assert.rejects(call('list',{module:'invoices',organization_id:'om',params:{filter_by:'Status.Unpaid'}}));
+    assert.equal((await call('list',{module:'contacts',organization_id:'om',params:{report_type:'receivables',date_start:'2026-08-01'}})).isError,true);
+    assert.equal((await call('list',{module:'invoices',organization_id:'om',params:{report_type:'receivables'}})).isError,true);
 
     // References below are synthetic integration data, not real finance acceptance.
     const {referenceKey}=await import("../finance-reference.js");
