@@ -5,11 +5,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import tools from "./tools.js";
+import tools, { resumeReportJob } from "./tools.js";
+import { startReportWorker } from "./report-worker.js";
 import { READ_ONLY, VERSION, BUILD_ID, integerSetting } from "./security.js";
 import * as db from "./db.js";
-import { ZohoOAuthProvider, zohoCallbackHandler } from "./oauth.js";
+import { ZohoOAuthProvider, zohoCallbackHandler, emailAllowed } from "./oauth.js";
 import instructions from "./instructions.js";
+import { verifyDownloadTicket, renderExport } from "./report-export.js";
+import { calculate, selectOrganizations } from "./reporting.js";
+import { MODULES } from "./modules.js";
+import { zohoRequest } from "./zoho.js";
 
 export function createMcpServer() {
   const server = new McpServer({ name: "zoho-books", version: VERSION }, { instructions });
@@ -18,10 +23,16 @@ export function createMcpServer() {
       annotations: tool.annotations }, async (args, extra) => {
       const userId = extra?.authInfo?.extra?.userId;
       if (!userId) return { content: [{ type: "text", text: "Reconnect your Zoho account" }], isError: true };
-      try { return await tool.run(args, userId); }
+      const started=Date.now();
+      try {
+        const result=await tool.run(args,userId);
+        db.recordEvent(userId,tool.name,result.isError?"error":"ok",Date.now()-started).catch(()=>{});
+        return result;
+      }
       catch (error) {
         const ref = crypto.randomUUID();
         console.error("[tool] failed", { ref, tool: tool.name, type: error.name });
+        db.recordEvent(userId,tool.name,"error",Date.now()-started).catch(()=>{});
         // Validation errors are authored locally. Never expose database/transport details.
         const safeMessage = error.name === "Error" && !error.code && !error.cause
           ? error.message : "Operation could not complete; no result was verified";
@@ -60,6 +71,25 @@ export function createApp(publicUrl) {
     try { await db.health(); res.json({ status: "ok", version: VERSION, build_id: BUILD_ID, tools: tools.length, readOnly: READ_ONLY }); }
     catch { res.status(503).json({ status: "degraded" }); }
   });
+  app.get("/reports/:id/download",async(req,res)=>{
+    try {
+      const claims=verifyDownloadTicket(req.query.ticket,req.params.id);
+      const user=await db.getUser(claims.userId);
+      if(!user||!emailAllowed(user.email))return res.status(403).json({error:"Account access is no longer permitted"});
+      const stored=await db.getReport(req.params.id,claims.userId);
+      if(!stored||stored.payload.kind==="raw")return res.status(404).json({error:"Report not found"});
+      const access=await zohoRequest(claims.userId,{method:"GET",path:"/organizations",noOrg:true});
+      if(!access.ok)return res.status(403).json({error:"Zoho access could not be verified"});
+      selectOrganizations(access.data.organizations,{organization_ids:stored.payload.organizations.map(o=>o.id)});
+      const result=calculate(stored.payload,MODULES[stored.payload.spec.module]);
+      result.reconciliation_differences=stored.payload.reconciliation_differences||[];
+      const output=renderExport(result,claims.format,claims.section);
+      if(Buffer.byteLength(output)>integerSetting("MAX_EXPORT_BYTES",20000000,1000,100000000))return res.status(413).json({error:"Export too large; use paginated get_report"});
+      res.set("Content-Disposition",'attachment; filename="report-'+req.params.id+'.'+claims.format+'"');
+      res.set("X-Content-Type-Options","nosniff");
+      res.type(claims.format==="json"?"application/json":"text/csv").send(output);
+    } catch {res.status(403).json({error:"Download expired or access denied"});}
+  });
   const active = new Map();
   app.post("/mcp", requireBearerAuth({ verifier: provider, resourceMetadataUrl }), async (req,res) => {
     const user = req.auth.extra.userId;
@@ -86,6 +116,7 @@ async function main() {
   if (missing.length) throw new Error("Missing configuration: " + missing.join(", "));
   const app = createApp(process.env.PUBLIC_URL);
   await db.migrate();
+  const stopWorker=startReportWorker(resumeReportJob);
   const server = app.listen(integerSetting("PORT", 8080, 1, 65535), () => console.log("Zoho Books MCP", VERSION, BUILD_ID, "tools:", tools.length));
   server.requestTimeout = 240000;
   server.headersTimeout = 30000;
@@ -93,6 +124,7 @@ async function main() {
   timer.unref();
   for (const signal of ["SIGTERM", "SIGINT"]) process.once(signal, () => {
     clearInterval(timer);
+    stopWorker();
     server.close(() => db.close().then(() => process.exit(0)));
     setTimeout(() => process.exit(1), 10000).unref();
   });

@@ -22,3 +22,4 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://postgres:synthetic-ci-only@127.0.0.1:5432/zoho_tests
       - run: npm audit --audit-level=moderate
+      - run: npm run test:finance

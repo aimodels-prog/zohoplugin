@@ -10,7 +10,7 @@ A multi-user OAuth server for Zoho Books. Every caller uses their own linked Zoh
 - Date/status filtering is performed locally over all retrieved records, so unsupported upstream filters cannot silently widen a monthly result.
 - Two complete reads compare unique record ID sets and normalized calculation/filter/grouping fields, independent of page boundaries and ordering. Duplicate/missing IDs, changed report fields, malformed responses and inaccessible organizations prevent a final total. One source-change retry is automatic and diagnostics identify changed IDs/fields. This is not a transactional snapshot.
 - Reports run in bounded batches of API requests. Continue the same report ID until retrieval and verification finish. Totals are null while incomplete. Never add successive summaries.
-- Receipt evidence, all groups, exclusions, original source records, and validation errors can be retrieved from the encrypted snapshot for 24 hours.
+- Receipt evidence, all groups, exclusions, original source records, and validation errors can be retrieved from the encrypted snapshot for 30 days by default.
 - `figures_are_complete` means retrieval and configured field validation succeeded. It does not mean finance reconciled the report.
 
 ## Financial definitions
@@ -19,16 +19,21 @@ A multi-user OAuth server for Zoho Books. Every caller uses their own linked Zoh
 
 The general `list` summary supports explicit source metrics: count; payment/expense amount; invoice/bill total or current balance; and selected document totals. It is not a recognized-revenue report, a consolidated financial statement, or a reconstructed historical balance.
 
-For example, date-filtered invoice balances are today's source balances on invoices dated in that range. They are not what was outstanding at that historic month-end. Historical `as_of` balances are rejected. Aging requires current balances, explicit due dates and an explicit as_of equal to today's UTC date; missing information is an error.
+For example, date-filtered invoice balances are today's source balances on invoices dated in that range. They are not what was outstanding at that historic month-end. Historical `as_of` balances are rejected. Aging requires current balances, explicit due dates and an explicit as_of equal to today's date in each organization's timezone (explicit UTC fallback if unavailable); missing information is an error.
 
 Net collections, recognized revenue, historic balances and intercompany eliminations require finance-approved rules or an appropriate Zoho source report. Unsupported interpretations are rejected/described explicitly rather than guessed.
 
 ## Tools
 
-Ten tools in read-only mode; fourteen when accounting writes are enabled:
+Fifteen tools in read-only mode; nineteen when accounting writes are enabled:
 
 | Tool | Purpose |
 |---|---|
+| ZohoBooks_report_definitions | Versioned definitions and configured expected entities |
+| ZohoBooks_finance_question | Bounded plain-language planner with explicit scope |
+| ZohoBooks_historical_receivables_report | Installed historical customer closing-balance export |
+| ZohoBooks_export_report | Short-lived JSON/CSV audit download |
+| ZohoBooks_connector_status | Account access, entity coverage and operational status |
 | ZohoBooks_collections_report | Gross payment-date receipts with explicit dates/scope |
 | ZohoBooks_receivables_report | Current customer balances directly from Zoho, ranked per entity/currency |
 | ZohoBooks_list | One raw page or an explicit source-field summary |
@@ -60,7 +65,7 @@ Use `get_report` with `section: "evidence"` for individual receipts; follow `nex
 
 ## Current customer receivables (v3.1)
 
-Use `ZohoBooks_receivables_report` with `organization_id`, `organization_ids`, or `all_organizations: true`. The default `currency_basis: "base"` uses Zoho?s recorded customer balance in each entity?s base currency. Foreign-currency contacts whose list response omits that field are read through the contact-detail endpoint; these reads also obey the ten-request continuation budget. No new OAuth scopes or account reconnects are required for existing connections.
+Use `ZohoBooks_receivables_report` with `organization_id`, `organization_ids`, or `all_organizations: true`. The default `currency_basis: "base"` uses Zoho?s recorded customer balance in each entity?s base currency. Foreign-currency contacts whose list response omits that field are read through the contact-detail endpoint; these reads also obey the configurable request budget (two per foreground/background batch by default). No new OAuth scopes or account reconnects are required for existing connections.
 
 `get_report` section `groups` returns every customer, sorted by balance within each organization/currency; follow `next_page`. Active and inactive customers are included. Unused credits are not automatically subtracted, currencies are not combined, and historical dates are rejected. These are current Zoho customer balances, not reconstructed invoice-only balances or certified historical closing balances.
 
@@ -103,7 +108,7 @@ Back up the database before the first v3 deployment. A migration locks credentia
 
 Only approved Zoho HTTPS origins are accepted; redirects are rejected. Managed PostgreSQL certificate verification is enabled. Supply `DATABASE_CA_PEM` if your provider uses a private CA. `DATABASE_SSL=false` is only appropriate for the private/local PostgreSQL connection. Use URL-encoded database passwords or the generated hexadecimal password in the Compose template.
 
-Reports expire after 24 hours and hourly cleanup removes expired snapshots and OAuth artifacts. Application logs omit tokens and report contents. Restrict proxy log access; OAuth callback query strings should not be retained.
+Reports expire after 30 days by default and hourly cleanup removes expired snapshots and OAuth artifacts. Application logs omit tokens and report contents. Restrict proxy log access; OAuth callback query strings should not be retained.
 
 ## Limits and operation
 
@@ -121,3 +126,7 @@ Reports expire after 24 hours and hourly cleanup removes expired snapshots and O
 `npm audit` checks dependencies. CI runs unit/integration tests with PostgreSQL 16. See FIXES.md for issue coverage and acceptance work still requiring finance evidence.
 
 For the August incident, obtain the actual finance export, original tool inputs/output and deployed build. Neither screenshot is an approved expected result.
+
+## Assurance and operations (v3.2)
+
+See [ASSURANCE.md](ASSURANCE.md) for reference import, coverage configuration, background recovery, secure exports and app-only deployment/backup procedures. Software tests are separate from real finance acceptance.

@@ -1,6 +1,7 @@
 import { parse } from "lossless-json";
 import { setTimeout as delay } from "node:timers/promises";
 import { integerSetting } from "./security.js";
+import { retryDelay } from "./request-pacing.js";
 
 export async function requestJson(url, options = {}, fetcher = fetch) {
   const safeRead = (options.method || "GET") === "GET";
@@ -12,9 +13,10 @@ export async function requestJson(url, options = {}, fetcher = fetch) {
         signal: AbortSignal.timeout(integerSetting("HTTP_TIMEOUT_MS", 20000, 100, 60000)),
       });
       if (safeRead && [429, 502, 503, 504].includes(response.status) && attempt < attempts - 1) {
-        const retry = Number(response.headers.get("retry-after"));
+        const retry = retryDelay(response.headers.get("retry-after"));
         await response.body?.cancel();
-        await delay(Math.min(3000, Math.max(250, Number.isFinite(retry) ? retry * 1000 : 250 * 2 ** attempt)));
+        if(retry>3000)return {status:response.status,httpOk:false,data:{code:"rate_limited"},retryAfterMs:retry};
+        await delay(Math.max(250,retry||250*2**attempt));
         continue;
       }
       // Parse decimal tokens as strings, avoiding binary floating-point loss at ingestion.
@@ -28,7 +30,7 @@ export async function requestJson(url, options = {}, fetcher = fetch) {
       let data;
       try { data = parse(Buffer.concat(chunks).toString("utf8"), undefined, value => value); }
       catch { throw new Error("Zoho returned invalid JSON"); }
-      return { status: response.status, httpOk: response.ok, data };
+      return { status: response.status, httpOk: response.ok, data, retryAfterMs:retryDelay(response.headers.get("retry-after")) };
     } catch (error) {
       if (safeRead && attempt < attempts - 1 && ["TypeError", "TimeoutError"].includes(error.name)) {
         await delay(250 * 2 ** attempt); continue;

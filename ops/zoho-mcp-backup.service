@@ -1,0 +1,6 @@
+[Unit]
+Description=Back up only the Zoho MCP database and encryption key
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/via/zoho-mcp/ops/backup.py

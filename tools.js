@@ -6,6 +6,11 @@ import { MODULES, MODULE_NAMES } from "./modules.js";
 import { READ_ONLY, VERSION, BUILD_ID, integerSetting } from "./security.js";
 import { validDate, selectOrganizations, createSnapshot, advanceSnapshot, calculate, extractRows, fingerprint, reconcileEvidence } from "./reporting.js";
 import { validateWrite, recordFingerprint } from "./write-safety.js";
+import { DEFINITIONS, definitionFor, expectedOrganizations, entityCoverage } from "./report-definitions.js";
+import { referenceKey, compareReference, historicalResult } from "./finance-reference.js";
+import { planFinanceQuestion } from "./question-plan.js";
+import { createDownloadTicket } from "./report-export.js";
+import { emailAllowed } from "./oauth.js";
 
 const tools = [];
 const add = (name, description, schema, run, write = false) => {
@@ -59,14 +64,69 @@ const summaryArgs = {
 async function report(args, userId, kind = "source_field") {
   const m = resolve(args, "list");
   if (m.noOrg || !m.idField) throw new Error("This module does not support validated reports");
-  const orgs = selectOrganizations(await organizations(userId), args);
+  const available = await organizations(userId), expected = expectedOrganizations();
+  if (args.all_organizations && !expected.length) throw new Error("Expected entity IDs are not configured. An administrator must register the five entities before a report can claim all-entity coverage. Explicit organization_ids remain available.");
+  if (args.all_organizations) selectOrganizations(available,args); // Reject conflicting explicit scope before substituting the registry.
+  const orgs = selectOrganizations(available, args.all_organizations ? { organization_ids: expected } : args);
   const spec = { kind, module: args.module, metric: args.metric ?? "count", currency_basis: args.currency_basis ?? "transaction",
     date_start: args.date_start, date_end: args.date_end, statuses: args.statuses, group_by: args.group_by, as_of: args.as_of,
     module_api_name: args.module_api_name, search_text: args.search_text, customer_id: args.customer_id, vendor_id: args.vendor_id };
   const snapshot = createSnapshot(spec, orgs);
-  await advanceSnapshot(snapshot, m, query => zohoRequest(userId, query));
+  snapshot.definition = definitionFor(spec);
+  snapshot.entity_coverage = entityCoverage(available,orgs.map(o=>String(o.organization_id)));
+  await advanceSnapshot(snapshot, m, query => zohoRequest(userId, query), integerSetting("REPORT_FOREGROUND_REQUESTS",2,1,10));
+  await autoReconcile(snapshot,userId,m);
   await db.saveReport(snapshot.id, userId, snapshot);
+  if(calculate(snapshot,m).summary.continuation_available)await db.enqueueReport(snapshot.id,userId,Math.max(0,...snapshot.organizations.map(o=>o.retry_after_ms||0)));
   return reply(calculate(snapshot, m).summary, userId);
+}
+async function autoReconcile(snapshot,userId,m) {
+  const result=calculate(snapshot,m);
+  if(!result.summary.figures_are_complete || snapshot.spec.metric==="count" || snapshot.reconciliation)return;
+  const refs=await db.matchingReferences(referenceKey(snapshot.spec,snapshot.organizations),userId);
+  snapshot.reference_check={status:refs.length?"no_comparable_reference":"no_operator_approved_reference",candidate_count:refs.length};
+  for(const ref of refs) {
+    let comparison;
+    try {
+      comparison=compareReference(snapshot,result,ref.payload);
+    } catch { continue; /* A stale or differently scoped reference must not certify a report. */ }
+    const {differences,...summary}=comparison;
+    snapshot.reconciliation={...summary,reference_id:ref.id};snapshot.reconciliation_differences=differences;
+    snapshot.reference_check={status:comparison.status,reference_id:ref.id};
+    await db.recordEvent(userId,"reconciliation",comparison.status);return;
+  }
+}
+export async function resumeReportJob(job) {
+  try {
+    const user=await db.getUser(job.user_id);
+    if(!user||!emailAllowed(user.email))throw new Error("Account access unavailable");
+    const stored=await db.getReport(job.report_id,job.user_id);
+    if(!stored || stored.payload.kind==="raw") {await db.finishReportJob(job,"failed");return;}
+    const s=stored.payload;
+    selectOrganizations(await organizations(job.user_id),{organization_ids:s.organizations.map(o=>o.id)});
+    const m=resolve(s.spec,"list");
+    await advanceSnapshot(s,m,q=>zohoRequest(job.user_id,q),integerSetting("REPORT_BACKGROUND_REQUESTS",2,1,10));
+    await autoReconcile(s,job.user_id,m);
+    const transient=s.organizations.some(o=>o.errors.length&&!o.blocked);
+    if(transient && job.failures>=4) {
+      for(const org of s.organizations)if(org.errors.length&&!org.blocked){org.blocked=true;org.errors.push("Background retries exhausted; start a new report after access or service recovery");}
+    }
+    await db.saveReport(job.report_id,job.user_id,s,stored.revision);
+    const next=calculate(s,m).summary;
+    await db.finishReportJob(job,next.continuation_available?"queued":next.figures_are_complete?"complete":"failed",transient,Math.max(0,...s.organizations.map(o=>o.retry_after_ms||0)));
+    if(!next.continuation_available)await db.recordEvent(job.user_id,"report",next.figures_are_complete?"complete":"failed");
+    return next;
+  } catch {
+    if(job.failures>=4) {
+      const current=await db.getReport(job.report_id,job.user_id);
+      if(current&&current.payload.kind!=="raw") {
+        for(const org of current.payload.organizations)if(!org.verified){org.blocked=true;org.errors=["Background retries exhausted; restore access and start a new report"];}
+        await db.saveReport(job.report_id,job.user_id,current.payload,current.revision);
+      }
+    }
+    await db.finishReportJob(job,job.failures>=4?"failed":"queued",true);
+    await db.recordEvent(job.user_id,"report_job","error");
+  }
 }
 add("collections_report",
   "Gross customer-payment receipts by payment date, not invoice date or net bank deposits. Explicit scope and inclusive dates required. Base mode uses Zoho's recorded bcy_amount; no guessed currency or exchange rate. Returns exact decimal strings, validation status and a report_id for receipt evidence. Continue incomplete retrieval with continue_report. Not reconciled with finance until externally compared.",
@@ -110,13 +170,55 @@ add("continue_report", "Continue a stored report's remaining pages. Scope is fix
   { report_id: z.string().uuid() }, async ({ report_id }, userId) => {
     const stored = await db.getReport(report_id, userId);
     if (!stored || stored.payload.kind === "raw") return fail("Report not found or expired");
-    const snapshot = stored.payload;
-    const available = await organizations(userId);
-    selectOrganizations(available, { organization_ids: snapshot.organizations.map(o => o.id) });
-    const m = resolve(snapshot.spec, "list");
-    await advanceSnapshot(snapshot, m, query => zohoRequest(userId, query));
-    await db.saveReport(report_id, userId, snapshot, stored.revision);
-    return reply(calculate(snapshot, m).summary, userId);
+    selectOrganizations(await organizations(userId),{organization_ids:stored.payload.organizations.map(o=>o.id)});
+    await db.enqueueReport(report_id,userId);
+    const job=await db.claimReportJob(report_id,userId);
+    if(job)await resumeReportJob(job);
+    const latest=await db.getReport(report_id,userId);
+    return reply({...calculate(latest.payload,resolve(latest.payload.spec,"list")).summary,background_job:await db.reportJobStatus(report_id,userId)},userId);
+  });
+
+add("report_definitions","Show the versioned calculation definitions, expected organization IDs, and which accounting interpretations remain unsupported. These definitions are not finance approval.",{},async()=>textResult({definitions:Object.values(DEFINITIONS),expected_organization_ids:expectedOrganizations(),finance_approval:"Requires operator-approved actual reference records"}));
+add("historical_receivables_report","Read an operator-approved historical customer closing-balance export by reference ID, explicit entity scope and exact as_of date. Never substitutes current balances. An administrator must install the actual source export first; this tool cannot invent or approve references.",
+  {...scopeArgs,reference_id:z.string().uuid(),as_of:date},async(args,userId)=>{
+    const {reference_id,as_of}=args;
+    const ref=await db.getReference(reference_id,userId);
+    if(!ref || ref.spec.as_of!==as_of)return fail("No approved historical reference for this ID and cutoff date");
+    const available=await organizations(userId);
+    if(args.all_organizations)selectOrganizations(available,args);
+    const scope=args.all_organizations?{organization_ids:expectedOrganizations()}:args;
+    const selected=selectOrganizations(available,scope).map(o=>String(o.organization_id));
+    if(fingerprint(selected.sort())!==fingerprint(ref.organizations.map(o=>o.organization_id).sort()))return fail("Historical reference scope differs from the requested entities");
+    return reply(historicalResult(ref,reference_id),userId);
+  });
+add("connector_status","Check this account's current Zoho access, expected-entity coverage, background report jobs and recent operational outcomes. No other user's accounts or events are exposed.",{},async(_args,userId)=>{
+  const available=await organizations(userId);
+  return textResult({version:VERSION,build_id:BUILD_ID,zoho_access:"ok",coverage:entityCoverage(available,available.map(o=>String(o.organization_id))),...await db.operationalStatus(userId)});
+});
+add("finance_question","Run a supported plain-language question through a deterministic report planner. Supports gross collections with explicit dates/named month, current customer receivables, or an installed historical reference. Provide exact entity IDs; unsupported/ambiguous requests return clarification instead of guessing. This planner does not guarantee how an external ChatGPT client interprets a question before calling it.",
+  {question:z.string().min(3).max(1000),organization_id:id.optional(),organization_ids:z.array(id).min(1).max(100).optional(),currency_basis:z.enum(["base","transaction"]).optional(),reference_id:z.string().uuid().optional()},
+  async(args,userId)=>{
+    const plan=planFinanceQuestion(args.question,args);
+    if(plan.status!=="ready")return textResult(plan);
+    if(plan.tool==="historical_receivables_report") {
+      const ref=await db.getReference(args.reference_id,userId);
+      if(!ref)return fail("Historical reference not found for this account");
+      const requested=plan.arguments.all_organizations?expectedOrganizations():args.organization_ids||[args.organization_id];
+      if(!requested.length||fingerprint([...requested].sort())!==fingerprint(ref.organizations.map(o=>o.organization_id).sort()))return fail("Historical reference scope differs from the requested entities");
+      if(args.currency_basis&&args.currency_basis!==ref.spec.currency_basis)return fail("Historical reference uses a different currency basis");
+      delete plan.arguments.currency_basis;
+    }
+    const tool=tools.find(t=>t.name==="ZohoBooks_"+plan.tool);
+    const result=await tool.run(z.object(tool.schema).strict().parse(plan.arguments),userId);
+    return { ...result,content:[{type:"text",text:JSON.stringify({report_plan:plan})},...result.content]};
+  });
+add("export_report","Create a five-minute download link for this account's report evidence. JSON includes summary and all audit sections; CSV exports a selected section with verification labels and spreadsheet-safe cells. Anyone holding the link can download until it expires, subject to current Zoho access. No export is sent to another person automatically.",
+  {report_id:z.string().uuid(),format:z.enum(["json","csv"]).default("json"),section:z.enum(["evidence","groups","exclusions","validation_errors","reconciliation_differences"]).default("evidence")},async({report_id,format,section},userId)=>{
+    const stored=await db.getReport(report_id,userId);
+    if(!stored||stored.payload.kind==="raw")return fail("Financial report not found or expired");
+    selectOrganizations(await organizations(userId),{organization_ids:stored.payload.organizations.map(o=>o.id)});
+    const ticket=createDownloadTicket(report_id,userId,format,section);
+    return textResult({download_url:process.env.PUBLIC_URL+"/reports/"+report_id+"/download?ticket="+encodeURIComponent(ticket),expires_in_seconds:300,report_retained_until:stored.expires_at});
   });
 
 add("reconcile_report", "Compare every included monetary record with an actual user-supplied finance export/reference. Never invent reference rows. Checks IDs, organizations, currencies and exact amounts; a matching total alone is insufficient. Stores comparison results and reference provenance; does not certify the external reference itself.",
@@ -137,7 +239,7 @@ add("reconcile_report", "Compare every included monetary record with an actual u
     return reply({ report_id, ...snapshot.reconciliation, differences: comparison.differences }, userId);
   });
 
-add("get_report", "Read a stored report summary, every group, receipt evidence, exclusions, validation errors, or original source records. Snapshots expire after 24 hours. Pages and text fragments preserve all stored data; use next_page/next_offset until absent. Stored reports are historical retrievals, not fresh Zoho reads.",
+add("get_report", "Read a stored report summary, every group, receipt evidence, exclusions, validation errors, or original source records. Retention defaults to 30 days; summary reports retained_until. Pages and text fragments preserve all stored data; use next_page/next_offset until absent. Stored reports are historical retrievals, not fresh Zoho reads.",
   { report_id: z.string().uuid(), section: z.enum(["summary", "evidence", "groups", "exclusions", "validation_errors", "source_records", "reconciliation_differences", "raw"]).default("summary"),
     page: z.coerce.number().int().min(1).default(1), per_page: z.coerce.number().int().min(1).max(100).default(50),
     offset: z.coerce.number().int().min(0).default(0) },
@@ -150,7 +252,7 @@ add("get_report", "Read a stored report summary, every group, receipt evidence, 
     else {
       selectOrganizations(await organizations(userId), { organization_ids: snapshot.organizations.map(o => o.id) });
       const result = calculate(snapshot, resolve(snapshot.spec, "list"));
-      value = section === "reconciliation_differences" ? snapshot.reconciliation_differences || [] : section === "summary" ? result.summary : section === "source_records"
+      value = section === "reconciliation_differences" ? snapshot.reconciliation_differences || [] : section === "summary" ? {...result.summary,retained_until:stored.expires_at,background_job:await db.reportJobStatus(report_id,userId)} : section === "source_records"
         ? snapshot.organizations.flatMap(o => o.rows.map(row => ({ organization_id: o.id, record: row })))
         : result[section];
       if (value === undefined) return fail("Invalid report section");

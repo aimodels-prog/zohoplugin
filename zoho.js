@@ -1,6 +1,7 @@
 import * as db from "./db.js";
 import { READ_ONLY, zohoOrigin } from "./security.js";
 import { requestJson, booksSuccess } from "./http.js";
+import { paceRequest } from "./request-pacing.js";
 
 const READ_SCOPES = ["contacts", "invoices", "estimates", "salesorders", "purchaseorders", "expenses",
   "customerpayments", "bills", "vendorpayments", "creditnotes", "debitnotes", "settings", "banking", "accountants", "users"];
@@ -76,10 +77,10 @@ export async function zohoRequest(userId, { method, path, query = {}, body, noOr
     const call = () => requestJson(apiUrl(user.zoho_api_domain, path, query), {
       method, headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json", Accept: "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    },async(url,options)=>{await paceRequest(user.zoho_api_domain+":"+(query.organization_id||userId));return fetch(url,options);});
     let r = await call();
     if (r.status === 401 && method === "GET") { token = await accessTokenFor(user, true); r = await call(); }
-    if (!booksSuccess(r)) return { ok: false, status: r.status, text: `Zoho Books rejected the request (HTTP ${r.status}, code ${String(r.data?.code ?? "unknown").slice(0, 20)}). No result was verified.` };
+    if (!booksSuccess(r)) return { ok: false, status: r.status, retry_after_ms:r.retryAfterMs||0,text: `Zoho Books rejected the request (HTTP ${r.status}, code ${String(r.data?.code ?? "unknown").slice(0, 20)}). No result was verified.` };
     return { ok: true, status: r.status, data: r.data, text: JSON.stringify(r.data) };
   } catch {
     return { ok: false, text: method === "GET" ? "Zoho read failed or timed out; retry the report" : "Write outcome is unknown. Inspect Zoho before attempting another operation." };

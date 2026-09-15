@@ -1,0 +1,6 @@
+[Unit]
+Description=Verify Zoho MCP backup restoration in an isolated temporary container
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/via/zoho-mcp/ops/backup.py --verify-restore

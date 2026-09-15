@@ -1,0 +1,6 @@
+[Unit]
+Description=Check Zoho MCP access and report processing
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker exec zoho-mcp-app node /app/scripts/monitor.mjs

@@ -2,7 +2,7 @@
 // restart or redeploy no longer invalidates connected clients or user sessions.
 
 import pg from "pg";
-import { encrypt, decrypt, tokenHash, validateEncryptionKey } from "./security.js";
+import { encrypt, decrypt, tokenHash, validateEncryptionKey, integerSetting } from "./security.js";
 
 // Managed Postgres (Railway, Neon, RDS) requires TLS; a Postgres container on the same
 // Docker network does not offer it at all, and forcing TLS there fails the connection.
@@ -84,6 +84,24 @@ export async function migrate() {
       request_key TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'preview',
       expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(user_id, request_key)
+    );
+    CREATE TABLE IF NOT EXISTS finance_references (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      match_key TEXT NOT NULL, payload TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT now()+interval '365 days'
+    );
+    CREATE INDEX IF NOT EXISTS finance_reference_match_idx ON finance_references(user_id,match_key,created_at DESC);
+    CREATE TABLE IF NOT EXISTS report_jobs (
+      report_id TEXT PRIMARY KEY REFERENCES report_snapshots(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      state TEXT NOT NULL DEFAULT 'queued', lease_token TEXT, lease_until TIMESTAMPTZ,
+      run_after TIMESTAMPTZ NOT NULL DEFAULT now(), failures INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS connector_events (
+      id BIGSERIAL PRIMARY KEY, user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+      category TEXT NOT NULL, outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
 
@@ -296,15 +314,57 @@ export async function issueTokenPair({ accessToken, refreshToken, clientId, user
 export async function saveReport(id, userId, payload, revision = null) {
   const value = encrypt(JSON.stringify(payload));
   if (revision === null) {
-    await pool.query("INSERT INTO report_snapshots(id,user_id,payload,expires_at) VALUES($1,$2,$3,now()+interval '24 hours')", [id,userId,value]);
+    await pool.query("INSERT INTO report_snapshots(id,user_id,payload,expires_at) VALUES($1,$2,$3,now()+($4::int * interval '1 day'))", [id,userId,value,integerSetting("REPORT_RETENTION_DAYS",30,1,365)]);
   } else {
     const r = await pool.query("UPDATE report_snapshots SET payload=$3, revision=revision+1 WHERE id=$1 AND user_id=$2 AND revision=$4 AND expires_at>now()", [id,userId,value,revision]);
     if (!r.rowCount) throw new Error('Report changed in another request; reload it');
   }
 }
 export async function getReport(id, userId) {
-  const { rows } = await pool.query('SELECT payload,revision FROM report_snapshots WHERE id=$1 AND user_id=$2 AND expires_at>now()', [id,userId]);
-  return rows[0] ? { payload: JSON.parse(decrypt(rows[0].payload)), revision: rows[0].revision } : null;
+  const { rows } = await pool.query('SELECT payload,revision,expires_at FROM report_snapshots WHERE id=$1 AND user_id=$2 AND expires_at>now()', [id,userId]);
+  return rows[0] ? { payload: JSON.parse(decrypt(rows[0].payload)), revision: rows[0].revision, expires_at: rows[0].expires_at } : null;
+}
+export async function saveReference(id, userId, key, payload) {
+  await pool.query('INSERT INTO finance_references(id,user_id,match_key,payload) VALUES($1,$2,$3,$4)',[id,userId,key,encrypt(JSON.stringify(payload))]);
+}
+export async function getReference(id, userId) {
+  const {rows}=await pool.query('SELECT payload FROM finance_references WHERE id=$1 AND user_id=$2 AND expires_at>now()',[id,userId]);
+  return rows[0] ? JSON.parse(decrypt(rows[0].payload)) : null;
+}
+export async function matchingReferences(key, userId) {
+  const {rows}=await pool.query('SELECT id,payload FROM finance_references WHERE match_key=$1 AND user_id=$2 AND expires_at>now() ORDER BY created_at DESC LIMIT 10',[key,userId]);
+  return rows.map(r=>({id:r.id,payload:JSON.parse(decrypt(r.payload))}));
+}
+export async function enqueueReport(reportId,userId,retryAfterMs=0) {
+  await pool.query("INSERT INTO report_jobs(report_id,user_id,run_after) VALUES($1,$2,now()+$3::double precision*interval '1 second') ON CONFLICT(report_id) DO NOTHING",[reportId,userId,Math.min(86400,Math.max(0,retryAfterMs/1000))]);
+}
+export async function claimReportJob(reportId=null,userId=null) {
+  const token=crypto.randomUUID();
+  const {rows}=await pool.query(`UPDATE report_jobs SET state='running',lease_token=$3,lease_until=now()+interval '10 minutes',updated_at=now()
+    WHERE report_id=(SELECT report_id FROM report_jobs WHERE ($1::text IS NULL OR report_id=$1) AND ($2::text IS NULL OR user_id=$2)
+    AND ((state='queued' AND run_after<=now()) OR (state='running' AND lease_until<now())) ORDER BY run_after LIMIT 1 FOR UPDATE SKIP LOCKED)
+    RETURNING report_id,user_id,lease_token,failures`,[reportId,userId,token]);
+  return rows[0] || null;
+}
+export async function finishReportJob(job,state,failed=false,retryAfterMs=0) {
+  await pool.query(`UPDATE report_jobs SET state=$3,lease_token=NULL,lease_until=NULL,failures=CASE WHEN $4 THEN failures+1 ELSE 0 END,
+    run_after=now()+GREATEST($5::double precision,CASE WHEN $4 THEN LEAST(300,5*power(2,failures)) ELSE 2 END)*interval '1 second',updated_at=now()
+    WHERE report_id=$1 AND lease_token=$2`,[job.report_id,job.lease_token,state,failed,Math.min(86400,Math.max(0,retryAfterMs/1000))]);
+}
+export async function reportJobStatus(reportId,userId) {
+  const {rows}=await pool.query('SELECT state,failures,run_after,updated_at FROM report_jobs WHERE report_id=$1 AND user_id=$2',[reportId,userId]);
+  return rows[0] || null;
+}
+export async function recordEvent(userId,category,outcome,duration=0) {
+  await pool.query('INSERT INTO connector_events(user_id,category,outcome,duration_ms) VALUES($1,$2,$3,$4)',[userId,category,outcome,Math.min(2147483647,Math.max(0,Math.round(duration)))]);
+}
+export async function operationalStatus(userId) {
+  const [jobs,events,refs]=await Promise.all([
+    pool.query('SELECT state,count(*)::int AS count FROM report_jobs WHERE user_id=$1 GROUP BY state',[userId]),
+    pool.query("SELECT category,outcome,count(*)::int AS count,round(avg(duration_ms))::int AS average_ms FROM connector_events WHERE user_id=$1 AND created_at>now()-interval '24 hours' GROUP BY category,outcome",[userId]),
+    pool.query('SELECT count(*)::int AS count FROM finance_references WHERE user_id=$1 AND expires_at>now()',[userId]),
+  ]);
+  return {jobs:jobs.rows,events_last_24_hours:events.rows,installed_finance_references:refs.rows[0].count};
 }
 export async function saveWrite(id, userId, key, payload) {
   const r = await pool.query("INSERT INTO write_operations(id,user_id,request_key,payload,expires_at) VALUES($1,$2,$3,$4,now()+interval '10 minutes') ON CONFLICT(user_id,request_key) DO NOTHING RETURNING id", [id,userId,key,encrypt(JSON.stringify(payload))]);
@@ -332,5 +392,7 @@ export async function cleanup() {
     DELETE FROM oauth_codes WHERE expires_at < now();
     DELETE FROM oauth_tokens WHERE expires_at < now();
     DELETE FROM report_snapshots WHERE expires_at < now();
-    DELETE FROM write_operations WHERE state='preview' AND expires_at < now();`);
+    DELETE FROM write_operations WHERE state='preview' AND expires_at < now();
+    DELETE FROM finance_references WHERE expires_at < now();
+    DELETE FROM connector_events WHERE created_at < now()-interval '30 days';`);
 }

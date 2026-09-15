@@ -1,6 +1,7 @@
 import Decimal from "decimal.js";
 import { createHash, randomUUID } from "node:crypto";
 import { VERSION, BUILD_ID, integerSetting } from "./security.js";
+import { currentDate } from "./report-definitions.js";
 
 Decimal.set({ precision: 50, rounding: Decimal.ROUND_HALF_UP });
 export function money(value) {
@@ -71,13 +72,15 @@ export function validateSpec(spec) {
   if (spec.as_of && !validDate(spec.as_of)) throw new Error("Invalid as_of date");
   if (spec.as_of && spec.metric !== "balance") throw new Error("as_of is supported only for current balance reports");
   if (spec.group_by === "aging" && (!["invoices", "bills"].includes(spec.module) || spec.metric !== "balance" || !spec.as_of)) throw new Error("Aging requires invoices/bills, metric balance, and an explicit current as_of date");
-  if (spec.metric === "balance" && spec.as_of && spec.as_of !== new Date().toISOString().slice(0, 10)) throw new Error("Historical balances are not reconstructed by this report. Use a historical Zoho report for that cutoff.");
   if (["customer", "vendor"].includes(spec.group_by) && !["contacts", ...Object.keys(METRICS)].includes(spec.module)) throw new Error("This module does not have a validated party grouping");
 }
 export function selectOrganizations(available, { organization_id, organization_ids, all_organizations }) {
   if (organization_ids && !organization_ids.length) throw new Error("organization_ids must not be empty");
   if ([Boolean(organization_id), Boolean(organization_ids), Boolean(all_organizations)].filter(Boolean).length !== 1) throw new Error("Select exactly one scope: organization_id, organization_ids, or all_organizations");
   const ids = organization_ids || (organization_id ? [organization_id] : null);
+  if (ids && new Set(ids).size !== ids.length) throw new Error("Duplicate requested organization IDs");
+  const availableIds=available.map(o=>String(o.organization_id ?? ""));
+  if (availableIds.some(id=>!id) || new Set(availableIds).size!==availableIds.length) throw new Error("Invalid or duplicated accessible organization IDs");
   if (!available.length) throw new Error("No accessible organizations");
   if (ids) {
     const missing = ids.filter(id => !available.some(o => String(o.organization_id) === id));
@@ -123,7 +126,9 @@ function resetOrganization(org) {
 export function createSnapshot(spec, orgs) {
   validateSpec(spec);
   const organizations = orgs.map(o => {
-    const org = { id: String(o.organization_id), name: o.name, currency: currency(o.currency_code), retry_count: 0, verification_failures: [] };
+    const timeZone=o.time_zone||process.env.REPORT_TIME_ZONE||"UTC";
+    if(spec.metric==="balance"&&spec.as_of&&spec.as_of!==currentDate(timeZone))throw new Error("Historical balances are not reconstructed by this report. Use a historical Zoho report for that cutoff.");
+    const org = { id: String(o.organization_id), name: o.name, currency: currency(o.currency_code), time_zone:timeZone, time_zone_basis:o.time_zone?"Zoho organization":process.env.REPORT_TIME_ZONE?"configured":"UTC fallback",retry_count: 0, verification_failures: [] };
     resetOrganization(org);
     return org;
   });
@@ -174,7 +179,11 @@ export async function advanceSnapshot(snapshot, module, read, budget = 10) {
   };
   for (const org of snapshot.organizations) {
     if (org.verified || org.blocked) continue;
+    if(snapshot.spec.metric==="balance"&&snapshot.spec.as_of&&snapshot.spec.as_of!==currentDate(org.time_zone||"UTC")) {
+      org.blocked=true;org.errors=["The requested aging calendar day is no longer current; use a historical source or start a new report"];continue;
+    }
     org.errors = [];
+    org.retry_after_ms=0;
     let originals = new Map(org.rows.map(row => [row[module.idField], row]));
     let seen = new Set(org.verification_ids);
     const failSource = detail => { sourceFailure(org, detail); originals = new Map(org.rows.map(row => [row[module.idField], row])); seen = new Set(org.verification_ids); };
@@ -185,7 +194,7 @@ export async function advanceSnapshot(snapshot, module, read, budget = 10) {
           ...(["invoices", "contacts"].includes(snapshot.spec.module) && { sort_column: "created_time", sort_order: "A" }),
           ...(snapshot.spec.kind === "receivables" && { contact_type: "customer", filter_by: "Status.All" }) };
         const r = await request({ method: "GET", path: module.path, query });
-        if (!r.ok) { org.errors.push(r.text); break; }
+        if (!r.ok) { org.errors.push(r.text); org.retry_after_ms=r.retry_after_ms||0; break; }
         let rows, terminal;
         try { rows = extractRows(r.data, module.rowKey); terminal = pagination(r.data, requestedPage, rows); }
         catch (error) { org.errors.push(error.message); org.blocked = true; break; }
@@ -209,7 +218,7 @@ export async function advanceSnapshot(snapshot, module, read, budget = 10) {
           : row.outstanding_receivable_amount == null || !currency(row.currency_code))) {
           if (budget <= 0) break;
           const r = await request({ method: "GET", path: module.path + "/" + encodeURIComponent(row[module.idField]), query: { organization_id: org.id } });
-          if (!r.ok) { org.errors.push(r.text); break; }
+          if (!r.ok) { org.errors.push(r.text); org.retry_after_ms=r.retry_after_ms||0; break; }
           const detail = r.data?.contact;
           if (!detail || detail.contact_id !== row.contact_id) { org.errors.push("Contact detail identity does not match the requested customer"); org.blocked = true; break; }
           for (const field of ["outstanding_receivable_amount", "outstanding_receivable_amount_bcy", "currency_code", "contact_name", "contact_type"]) row[field] = detail[field];
@@ -348,8 +357,12 @@ export function calculate(snapshot, module) {
   }
   return {
     summary: { report_id: snapshot.id, version: snapshot.version, build_id: snapshot.build_id, specification: spec,
+      ...(snapshot.definition && {definition:snapshot.definition}),
+      ...(snapshot.entity_coverage && {entity_coverage:snapshot.entity_coverage}),
+      ...(snapshot.reference_check && {reference_check:snapshot.reference_check}),
       started_at: snapshot.started_at, finished_at: snapshot.finished_at,
       organizations: snapshot.organizations.map(o => ({ organization_id: o.id, name: o.name, base_currency: o.currency,
+        time_zone:o.time_zone||"UTC",time_zone_basis:o.time_zone_basis||"legacy UTC",
         fetched_records: o.rows.length, pages: o.page - 1, retrieval_complete: o.done, second_pass_verified: o.verified, errors: o.errors,
         verification_pages: o.verification_page - 1, retry_count: o.retry_count || 0, attempt_started_at: o.attempt_started_at,
         verified_at: o.verified_at, verification_failures: o.verification_failures || [],
@@ -370,7 +383,7 @@ export function calculate(snapshot, module) {
       definition: spec.kind === "collections" ? "Gross recorded customer-payment receipts by payment date. Refunds, fees, withholding and invoice allocations are not netted. Uses recorded base amounts when requested." :
         spec.kind === "receivables" ? "Current customer outstanding balances reported by Zoho Contacts, including inactive customers. Unused credits are not independently subtracted. Not a historical closing balance or an invoice-only total. Ranking is separate for each organization and currency." :
         `Source-field ${spec.metric} report. Not recognized revenue, consolidated accounts, net cash flow, or reconstructed historical balances.`,
-      ...(spec.metric === "balance" && { balance_basis: "Current source balances at retrieval; date filters select invoice/bill dates, not historical settlement cutoffs", aging_calendar: "Explicit as_of date, restricted to today's UTC date" }),
+      ...(spec.metric === "balance" && { balance_basis: "Current source balances at retrieval; date filters select invoice/bill dates, not historical settlement cutoffs", aging_calendar: "Explicit as_of date, restricted to today's date in the reported organization timezone" }),
     }, evidence, exclusions: excluded, validation_errors: errors, groups: rankedGroups,
   };
 }

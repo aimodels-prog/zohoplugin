@@ -9,7 +9,8 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
   process.env.TOKEN_ENCRYPTION_KEY = "34".repeat(32);
   process.env.ZOHO_READ_ONLY = "false";
   process.env.ZOHO_CLIENT_ID = "synthetic-client";
-  process.env.ZOHO_CLIENT_SECRET = "synthetic-secret";
+    process.env.ZOHO_CLIENT_SECRET = "synthetic-secret";
+    process.env.ZOHO_MIN_REQUEST_INTERVAL_MS = "0";
   process.env.ALLOWED_EMAIL_DOMAINS = "example.test";
   const db = await import("../db.js");
   const { default: pg } = await import("pg");
@@ -59,11 +60,12 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     assert.ok(await db.getToken(atomic.refresh_token), "failed issuance must roll back consumption");
 
     let writes = 0; let currentName = "Original";
+    let accessibleOrgs=[{organization_id:"om",name:"Oman",currency_code:"OMR",time_zone:"Asia/Muscat"}];
     global.fetch = async (url, options = {}) => {
       url = new URL(url);
       if (url.hostname === "127.0.0.1") return originalFetch(url, options);
       if (url.pathname.endsWith("/oauth/v2/token")) return Response.json({ access_token: "synthetic-access", expires_in: 3600 });
-      if (url.pathname.endsWith("/organizations")) return Response.json({ code: 0, organizations: [{ organization_id: "om", name: "Oman", currency_code: "OMR" }] });
+      if (url.pathname.endsWith("/organizations")) return Response.json({ code: 0, organizations: accessibleOrgs });
       if (url.pathname.endsWith("/contacts") && (options.method || "GET") === "GET") {
         assert.equal(url.searchParams.get("contact_type"), "customer");
         assert.equal(url.searchParams.get("filter_by"), "Status.All");
@@ -149,6 +151,98 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "ZohoBooks_collections_report", arguments: { organization_id: "om", date_start: "2026-08-01", date_end: "2026-08-31", filter_by: "ignored-filter" } } }) });
     const invalidResult = await invalidCall.json();
     assert.ok(invalidResult.error || invalidResult.result?.isError);
+
+    // References below are synthetic integration data, not real finance acceptance.
+    const {referenceKey}=await import("../finance-reference.js");
+    const {resumeReportJob}=await import("../tools.js");
+    const cleanSpec=JSON.parse(JSON.stringify(snapshot.payload.spec));
+    const reference={schema_version:1,label:"Synthetic integration reference only",source:{type:"finance_export",report_name:"Synthetic receipts",exported_at:"2026-09-01T00:00:00Z",sha256:"0".repeat(64)},approval:{approved_by:"Synthetic test actor",approved_at:"2026-09-01T00:00:01Z"},definition_id:"gross_collections_v1",spec:cleanSpec,organizations:accessibleOrgs,records:[{organization_id:"om",record_id:"1",currency:"OMR",amount:"80.123"},{organization_id:"om",record_id:"2",currency:"OMR",amount:"1.234"}]};
+    const referenceId=randomUUID();
+    await db.saveReference(referenceId,"test-user",referenceKey(cleanSpec,accessibleOrgs),reference);
+    assert.equal(await db.getReference(referenceId,"other-user"),null);
+    assert.match((await pool.query("SELECT payload FROM finance_references WHERE id=$1",[referenceId])).rows[0].payload,/^enc:v1:/);
+    const automatic=payload(await call("collections_report",{organization_id:"om",date_start:"2026-08-01",date_end:"2026-08-31"}));
+    assert.equal(automatic.reference_check.status,"matches_supplied_reference");
+    assert.ok(new Date((await db.getReport(automatic.report_id,"test-user")).expires_at)-Date.now()>29*86400000);
+
+    // Exercise lease ownership, expiry recovery and upstream backoff in real SQL.
+    process.env.REPORT_FOREGROUND_REQUESTS="1";
+    const pending=payload(await call("collections_report",{organization_id:"om",date_start:"2026-08-01",date_end:"2026-08-31"}));
+    delete process.env.REPORT_FOREGROUND_REQUESTS;
+    assert.equal(pending.figures_are_complete,false);
+    assert.equal(await db.claimReportJob(pending.report_id,"other-user"),null);
+    const jobClaims=await Promise.all([db.claimReportJob(pending.report_id,"test-user"),db.claimReportJob(pending.report_id,"test-user")]);
+    assert.equal(jobClaims.filter(Boolean).length,1);
+    const abandoned=jobClaims.find(Boolean);
+    await pool.query("UPDATE report_jobs SET lease_until=now()-interval '1 second' WHERE report_id=$1",[pending.report_id]);
+    const recovered=await db.claimReportJob(pending.report_id,"test-user");
+    assert.notEqual(recovered.lease_token,abandoned.lease_token);
+    await db.finishReportJob(abandoned,"failed");
+    assert.equal((await db.reportJobStatus(pending.report_id,"test-user")).state,"running");
+    await db.finishReportJob(recovered,"queued",true,120000);
+    assert.equal(await db.claimReportJob(pending.report_id,"test-user"),null);
+    await pool.query("UPDATE report_jobs SET run_after=now() WHERE report_id=$1",[pending.report_id]);
+    await resumeReportJob(await db.claimReportJob(pending.report_id,"test-user"));
+    assert.equal((await db.reportJobStatus(pending.report_id,"test-user")).state,"complete");
+    assert.equal(payload(await call("get_report",{report_id:pending.report_id})).data.figures_are_complete,true);
+
+    process.env.PUBLIC_URL=origin;
+    assert.equal((await call("export_report",{report_id:automatic.report_id},"other-user")).isError,true);
+    const download=payload(await call("export_report",{report_id:automatic.report_id}));
+    const exported=await originalFetch(download.download_url);
+    assert.equal(exported.status,200);assert.equal(exported.headers.get("cache-control"),"no-store");
+    assert.equal((await exported.json()).evidence.length,2);
+    assert.equal((await originalFetch(download.download_url+"x")).status,403);
+    accessibleOrgs=[];
+    assert.equal((await originalFetch(download.download_url)).status,403);
+    accessibleOrgs=reference.organizations;
+    await pool.query("UPDATE users SET email='revoked@revoked.test' WHERE id='test-user'");
+    assert.equal((await originalFetch(download.download_url)).status,403);
+    await pool.query("UPDATE users SET email='finance@example.test' WHERE id='test-user'");
+
+    const historical={...reference,definition_id:"historical_receivables_v1",spec:{kind:"historical_receivables",module:"contacts",metric:"closing_balance",currency_basis:"base",as_of:"2026-08-31",group_by:"customer"}};
+    const historicalId=randomUUID();await db.saveReference(historicalId,"test-user",referenceKey(historical.spec,accessibleOrgs),historical);
+    assert.equal(payload(await call("historical_receivables_report",{reference_id:historicalId,organization_id:"om",as_of:"2026-08-31"})).totals[0].amount,"81.357");
+    assert.equal((await call("historical_receivables_report",{reference_id:historicalId,organization_id:"om",as_of:"2026-08-30"})).isError,true);
+    assert.equal((await call("historical_receivables_report",{reference_id:historicalId,organization_id:"om",as_of:"2026-08-31"},"other-user")).isError,true);
+
+    const question=async(question,extra={})=>{
+      const response=await originalFetch(origin+"/mcp",{method:"POST",headers:{"Content-Type":"application/json",Accept:"application/json, text/event-stream",Authorization:"Bearer "+auth.access_token},body:JSON.stringify({jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"ZohoBooks_finance_question",arguments:{question,...extra}}})});
+      const body=await response.json();assert.equal(body.result.isError,false,JSON.stringify(body));return body.result.content.map(c=>JSON.parse(c.text));
+    };
+    assert.equal((await question("Collections for August 2026",{organization_id:"om"}))[1].totals[0].amount.exact,"81.357");
+    assert.equal((await question("Outstanding receivables by customer",{organization_id:"om"}))[1].totals[0].amount.exact,"123.456");
+    assert.equal((await question("Net collections for August 2026",{organization_id:"om"}))[0].status,"needs_clarification");
+    process.env.EXPECTED_ORGANIZATION_IDS="om,ae,sa,qa,bh";
+    accessibleOrgs=["om","ae","sa","qa","bh"].map(organization_id=>({organization_id,name:"Synthetic "+organization_id,currency_code:"OMR",time_zone:"Asia/Muscat"}));
+    process.env.REPORT_FOREGROUND_REQUESTS="10";
+    await assert.rejects(call("receivables_report",{all_organizations:true,organization_id:"om"}),/exactly one/);
+    const all=(await question("Outstanding receivables for all five entities"))[1];
+    assert.equal(all.entity_coverage.status,"all_expected_entities_covered");assert.equal(all.totals.length,5);
+    accessibleOrgs=accessibleOrgs.slice(1);
+    await assert.rejects(call("receivables_report",{all_organizations:true}),/accessible|access/i);
+    delete process.env.EXPECTED_ORGANIZATION_IDS;delete process.env.REPORT_FOREGROUND_REQUESTS;
+    await assert.rejects(call("receivables_report",{all_organizations:true}),/not configured/);
+    accessibleOrgs=reference.organizations;
+    process.env.REPORT_FOREGROUND_REQUESTS="1";
+    const doomed=payload(await call("collections_report",{organization_id:"om",date_start:"2026-08-01",date_end:"2026-08-31"}));
+    delete process.env.REPORT_FOREGROUND_REQUESTS;
+    await pool.query("UPDATE report_jobs SET failures=4 WHERE report_id=$1",[doomed.report_id]);
+    await pool.query("UPDATE users SET email='revoked@revoked.test' WHERE id='test-user'");
+    await resumeReportJob(await db.claimReportJob(doomed.report_id,"test-user"));
+    assert.equal((await db.reportJobStatus(doomed.report_id,"test-user")).state,"failed");
+    assert.equal((await db.getReport(doomed.report_id,"test-user")).payload.organizations[0].blocked,true);
+    await pool.query("UPDATE users SET email='finance@example.test' WHERE id='test-user'");
+    process.env.REPORT_FOREGROUND_REQUESTS="1";
+    const background=payload(await call("collections_report",{organization_id:"om",date_start:"2026-08-01",date_end:"2026-08-31"}));
+    delete process.env.REPORT_FOREGROUND_REQUESTS;
+    const {startReportWorker}=await import("../report-worker.js");
+    const stopWorker=startReportWorker(resumeReportJob,10);
+    try {
+      const deadline=Date.now()+3000;
+      while((await db.reportJobStatus(background.report_id,"test-user")).state!=="complete"&&Date.now()<deadline)await new Promise(r=>setTimeout(r,20));
+      assert.equal((await db.reportJobStatus(background.report_id,"test-user")).state,"complete");
+    } finally {stopWorker();}
     await db.cleanup();
   } finally {
     global.fetch = originalFetch;

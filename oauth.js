@@ -32,7 +32,7 @@ const allowedDomains = (process.env.ALLOWED_EMAIL_DOMAINS || "")
   .map((d) => d.trim().toLowerCase().replace(/^@/, ""))
   .filter(Boolean);
 
-function emailAllowed(email) {
+export function emailAllowed(email) {
   if (!allowedDomains.length) return true;
   const domain = String(email || "").split("@")[1]?.toLowerCase();
   return Boolean(domain && allowedDomains.includes(domain));
