@@ -74,8 +74,13 @@ add("collections_report",
     group_by: z.enum(["customer", "month", "status", "currency"]).optional() },
   (args, userId) => report({ ...args, module: "customer_payments", metric: "amount" }, userId, "collections"));
 
+add("receivables_report",
+  "Current outstanding receivables by customer directly from Zoho Contacts. Includes active and inactive customers. Base mode uses recorded outstanding_receivable_amount_bcy, fetching contact details when needed; never guesses exchange rates. Does not subtract unused credits or reconstruct historical balances. Explicit organization scope required. Continue incomplete reports with continue_report; get_report section groups returns all customers ranked separately within each organization/currency, and evidence returns source amounts. Two complete reads verify IDs and report fields, with one bounded retry for changes.",
+  { ...scopeArgs, currency_basis: z.enum(["base", "transaction"]).default("base"), customer_id: id.optional() },
+  (args, userId) => report({ ...args, module: "contacts", metric: "outstanding_receivable_amount", group_by: "customer" }, userId, "receivables"));
+
 add("list",
-  "List one explicit organization's page, or build a validated source-field summary using summarize/group_by. A raw page is not a total. For collections use collections_report. Source total is not recognized revenue; balance is current, not a historical cutoff balance. Summaries allow only typed local date/status filters and explicit metric; unsupported financial interpretations must use a finance-approved source report.",
+  "List one explicit organization's page, or build a validated source-field summary using summarize/group_by. A raw page is not a total. For collections use collections_report; for current customer outstanding balances use receivables_report. Source total is not recognized revenue; balance is current, not a historical cutoff balance. Summaries allow only typed local date/status filters and explicit metric; unsupported financial interpretations must use a finance-approved source report.",
   { ...moduleArg, ...scopeArgs, ...summaryArgs, module_api_name: id.optional(), summarize: z.boolean().optional(),
     page: z.coerce.number().int().min(1).default(1), per_page: z.coerce.number().int().min(1).max(200).default(100),
     entity: id.optional(),

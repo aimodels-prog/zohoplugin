@@ -1,6 +1,6 @@
 {
   "name": "zoho-books-mcp",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "description": "Multi-user Zoho Books MCP with validated financial reports",

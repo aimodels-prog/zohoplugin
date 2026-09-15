@@ -18,3 +18,11 @@ Startup encrypts legacy credentials. Do not roll the old app back against the up
 Use the existing Caddy service's logs, not `docker compose logs caddy` in this application directory. Restrict access to logs and strip OAuth query strings. Back up PostgreSQL and the encryption key; snapshots expire, but credentials and operation audit records are persistent.
 
 No deployment is performed by editing these files.
+
+## Upgrading the existing v3 service to v3.1
+
+The live application is `/opt/via/zoho-mcp`; the shared proxy is a separate service. Preserve the existing `.env`, encryption key, PUBLIC_URL, Zoho client credentials and ZOHO_READ_ONLY setting. This update needs no new scopes or user reconnection. Do not follow the first-install steps to replace credentials or proxy configuration.
+
+Back up this application's source, environment and database, and tag the currently running app image for rollback. Build the new release before stopping the app. Set BUILD_ID to the exact pushed commit, validate Compose with `config --quiet`, then replace only this app with `docker compose up -d --no-deps --no-build --force-recreate app`. Do not use `down`, recreate Postgres, or reload the shared Caddy service. Compare unrelated containers' IDs, start times and restart counts before and after.
+
+Verify `/health` reports version 3.1.0, the expected commit and the existing read-only setting; there are 14 tools when writes are enabled (10 otherwise). Verify the existing linked account and OAuth credential records survive. V3.1 uses the existing encrypted database format. Old stored reports can be read; continuing them restarts both retrieval passes with the same scope under the new verification method.

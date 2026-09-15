@@ -6,9 +6,9 @@ A multi-user OAuth server for Zoho Books. Every caller uses their own linked Zoh
 
 - Every call names its organization(s); an account preference never silently changes report scope.
 - Monetary values are decimal strings. Exact sums are retained; display rounding follows currency precision, including OMR's three decimals.
-- Transaction currency and organization base currency are separate. Base reports use recorded `bcy_*` amounts or an explicitly matching transaction currency. Missing amounts/currencies invalidate the result; no exchange rates are guessed.
+- Transaction currency and organization base currency are separate. Base reports use recorded `bcy_*` amounts (or `outstanding_receivable_amount_bcy` for customer balances) or an explicitly matching transaction currency. Missing amounts/currencies invalidate the result; no exchange rates are guessed.
 - Date/status filtering is performed locally over all retrieved records, so unsupported upstream filters cannot silently widen a monthly result.
-- Every source page is read twice and compared. Duplicate IDs, malformed responses, inaccessible organizations, changed pages and missing fields prevent a final total. This detects many source changes but cannot create a transactional snapshot of Zoho.
+- Two complete reads compare unique record ID sets and normalized calculation/filter/grouping fields, independent of page boundaries and ordering. Duplicate/missing IDs, changed report fields, malformed responses and inaccessible organizations prevent a final total. One source-change retry is automatic and diagnostics identify changed IDs/fields. This is not a transactional snapshot.
 - Reports run in bounded batches of API requests. Continue the same report ID until retrieval and verification finish. Totals are null while incomplete. Never add successive summaries.
 - Receipt evidence, all groups, exclusions, original source records, and validation errors can be retrieved from the encrypted snapshot for 24 hours.
 - `figures_are_complete` means retrieval and configured field validation succeeded. It does not mean finance reconciled the report.
@@ -25,11 +25,12 @@ Net collections, recognized revenue, historic balances and intercompany eliminat
 
 ## Tools
 
-Nine tools in read-only mode; thirteen when accounting writes are enabled:
+Ten tools in read-only mode; fourteen when accounting writes are enabled:
 
 | Tool | Purpose |
 |---|---|
 | ZohoBooks_collections_report | Gross payment-date receipts with explicit dates/scope |
+| ZohoBooks_receivables_report | Current customer balances directly from Zoho, ranked per entity/currency |
 | ZohoBooks_list | One raw page or an explicit source-field summary |
 | ZohoBooks_continue_report | Resume retrieval and the verification pass |
 | ZohoBooks_get_report | Read summary/evidence/groups/errors/source records in pages or fragments |
@@ -56,6 +57,18 @@ Example collections arguments:
 Use `get_report` with `section: "evidence"` for individual receipts; follow `next_page`. If a single record/page exceeds the output limit, follow `next_offset` and concatenate the JSON text fragments before parsing. Every fragment is itself returned inside valid JSON.
 
 `reconcile_report` requires an actual reference label and rows containing organization_id, record_id, currency, and amount (a decimal string). It detects missing/extra receipts as well as amount/currency differences. Its status is `matches_supplied_reference` or `differs_from_supplied_reference`; it does not authenticate the reference or claim independent finance approval.
+
+## Current customer receivables (v3.1)
+
+Use `ZohoBooks_receivables_report` with `organization_id`, `organization_ids`, or `all_organizations: true`. The default `currency_basis: "base"` uses Zoho?s recorded customer balance in each entity?s base currency. Foreign-currency contacts whose list response omits that field are read through the contact-detail endpoint; these reads also obey the ten-request continuation budget. No new OAuth scopes or account reconnects are required for existing connections.
+
+`get_report` section `groups` returns every customer, sorted by balance within each organization/currency; follow `next_page`. Active and inactive customers are included. Unused credits are not automatically subtracted, currencies are not combined, and historical dates are rejected. These are current Zoho customer balances, not reconstructed invoice-only balances or certified historical closing balances.
+
+Verification ignores unrelated metadata and record ordering, normalizes decimal representation, and checks complete ID membership in both reads. Invoices and contacts request `created_time` ascending; this reduces page movement but is not a unique-sort or snapshot guarantee. A changing source is retried once with both reads restarted. Persistent failures provide bounded ID/field samples under `organizations[].verification_failures`; no final total or ranking is emitted.
+
+Existing stored reports keep their original verification label. Continuing a legacy report restarts both passes under the original scope and clears any old reconciliation. New reports use `record-fields-v1`. Original source records remain retrieval evidence; only report-relevant fields are covered by verification. The aggregate invoice filter `unpaid` is rejected as a local exact status to prevent silently excluding sent/overdue/partially paid invoices.
+
+References: [Zoho Contacts API](https://www.zoho.com/books/api/v3/contacts/), [Zoho receivables reports](https://www.zoho.com/books/help/reports/receivables.html).
 
 ## Setup
 
@@ -95,7 +108,7 @@ Reports expire after 24 hours and hourly cleanup removes expired snapshots and O
 ## Limits and operation
 
 - HTTP reads: 20-second attempt timeout, up to three attempts for transient failures. Writes are never automatically retried.
-- A report call performs up to ten page requests. Calls continue from encrypted state and use optimistic concurrency to reject conflicting updates.
+- A report call performs up to ten API requests, including contact details when a required balance is missing from a list. Calls continue from encrypted state and use optimistic concurrency to reject conflicting updates.
 - MAX_REPORT_RECORDS defaults to 100,000 per snapshot. Hitting it blocks a final total. Because date filtering is local, a shorter requested date range does not reduce upstream scanning. For organizations beyond this limit use a native export or raise the bound after capacity review.
 - MAX_API_BYTES defaults to 8 MB per upstream response. MAX_RESPONSE_CHARS defaults to 60,000; oversized output is stored and read through get_report.
 - Two concurrent MCP requests per user per process. For multiple replicas, put shared rate limits at the proxy. Stable encryption key and PostgreSQL are shared.

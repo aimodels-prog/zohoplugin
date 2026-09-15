@@ -64,6 +64,11 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
       if (url.hostname === "127.0.0.1") return originalFetch(url, options);
       if (url.pathname.endsWith("/oauth/v2/token")) return Response.json({ access_token: "synthetic-access", expires_in: 3600 });
       if (url.pathname.endsWith("/organizations")) return Response.json({ code: 0, organizations: [{ organization_id: "om", name: "Oman", currency_code: "OMR" }] });
+      if (url.pathname.endsWith("/contacts") && (options.method || "GET") === "GET") {
+        assert.equal(url.searchParams.get("contact_type"), "customer");
+        assert.equal(url.searchParams.get("filter_by"), "Status.All");
+        return Response.json({ code: 0, contacts: [{ contact_id: "c1", contact_name: "Customer", contact_type: "customer", currency_code: "OMR", outstanding_receivable_amount: "123.456" }], page_context: { has_more_page: false } });
+      }
       if (url.pathname.endsWith("/customerpayments")) return Response.json({ code: 0, customer_payments: [
         { payment_id: "1", date: "2026-08-01", amount: "200", bcy_amount: "80.123" },
         { payment_id: "2", date: "2026-08-31", currency_code: "OMR", amount: "1.234", bcy_amount: "1.234" },
@@ -74,6 +79,14 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     const summary = payload(await call("collections_report", { organization_id: "om", date_start: "2026-08-01", date_end: "2026-08-31" }));
     assert.equal(summary.totals[0].amount.exact, "81.357");
     assert.equal(summary.record_count, 2);
+    const receivables = payload(await call("receivables_report", { organization_id: "om" }));
+    assert.equal(receivables.totals[0].amount.exact, "123.456");
+    assert.equal(receivables.verification_method, "record-fields-v1");
+    assert.equal(await db.getReport(receivables.report_id, "other-user"), null);
+    const ranked = payload(await call("get_report", { report_id: receivables.report_id, section: "groups" }));
+    assert.equal(ranked.data[0].group_id, "c1");
+    assert.equal(ranked.data[0].rank_in_organization_currency, 1);
+    await assert.rejects(call("receivables_report", { organization_id: "om", as_of: "2026-08-31" }));
     assert.equal(await db.getReport(summary.report_id, "other-user"), null);
     assert.equal(payload(await call("get_report", { report_id: summary.report_id, section: "evidence" })).data.length, 2);
     const compared = payload(await call("reconcile_report", { report_id: summary.report_id, reference_label: "Synthetic test fixture, not finance data", records: [
@@ -131,6 +144,7 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     assert.equal(mcp.status, 200);
     const listed = await mcp.json();
     assert.ok(listed.result.tools.some(t => t.name === "ZohoBooks_collections_report"));
+    assert.ok(listed.result.tools.some(t => t.name === "ZohoBooks_receivables_report"));
     const invalidCall = await originalFetch(origin + "/mcp", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: "Bearer " + auth.access_token },
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "ZohoBooks_collections_report", arguments: { organization_id: "om", date_start: "2026-08-01", date_end: "2026-08-31", filter_by: "ignored-filter" } } }) });
     const invalidResult = await invalidCall.json();

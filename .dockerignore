@@ -13,3 +13,4 @@ run-local.ps1
 test
 .github
 coverage
+.verify
