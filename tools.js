@@ -11,6 +11,8 @@ import { referenceKey, compareReference, historicalResult } from "./finance-refe
 import { planFinanceQuestion } from "./question-plan.js";
 import { createDownloadTicket } from "./report-export.js";
 import { emailAllowed } from "./oauth.js";
+import { reportResponse } from "./report-response.js";
+import { setTimeout as delay } from "node:timers/promises";
 
 const tools = [];
 const add = (name, description, schema, run, write = false) => {
@@ -52,7 +54,7 @@ async function checkOrg(userId, organizationId) {
   return selectOrganizations(await organizations(userId), { organization_id: organizationId })[0];
 }
 const summaryArgs = {
-  metric: z.enum(["count", "amount", "total", "balance"]).default("count"),
+  metric: z.enum(["count", "amount", "total", "balance"]).optional().describe("Required for summaries/grouping. count counts documents, not money. Use receivables_report for customer outstanding ranking."),
   currency_basis: z.enum(["transaction", "base"]).default("transaction"),
   date_start: date.optional(), date_end: date.optional(),
   statuses: z.array(z.string().min(1)).min(1).optional(),
@@ -62,6 +64,7 @@ const summaryArgs = {
   as_of: date.optional(),
 };
 async function report(args, userId, kind = "source_field") {
+  if (!args.metric) throw new Error("An explicit metric is required for a summary: count counts records, not money. For customer outstanding receivables and rankings call ZohoBooks_receivables_report with the same organization scope. For an invoice-only balance summary explicitly specify metric: balance.");
   const m = resolve(args, "list");
   if (m.noOrg || !m.idField) throw new Error("This module does not support validated reports");
   const available = await organizations(userId), expected = expectedOrganizations();
@@ -74,11 +77,37 @@ async function report(args, userId, kind = "source_field") {
   const snapshot = createSnapshot(spec, orgs);
   snapshot.definition = definitionFor(spec);
   snapshot.entity_coverage = entityCoverage(available,orgs.map(o=>String(o.organization_id)));
-  await advanceSnapshot(snapshot, m, query => zohoRequest(userId, query), integerSetting("REPORT_FOREGROUND_REQUESTS",2,1,10));
-  await autoReconcile(snapshot,userId,m);
-  await db.saveReport(snapshot.id, userId, snapshot);
-  if(calculate(snapshot,m).summary.continuation_available)await db.enqueueReport(snapshot.id,userId,Math.max(0,...snapshot.organizations.map(o=>o.retry_after_ms||0)));
-  return reply(calculate(snapshot, m).summary, userId);
+  await db.saveReport(snapshot.id, userId, snapshot,null,true);
+  return reply(await awaitReport(snapshot.id,userId),userId);
+}
+const activeReportJobs = new Map();
+let stoppingReports = false;
+export async function awaitReport(reportId,userId) {
+  const deadline=Date.now()+integerSetting("REPORT_WAIT_SECONDS",20,0,45)*1000;
+  let stored,result,enqueued=false;
+  while (true) {
+    // Poll the revision, not the potentially large encrypted financial payload.
+    const revision=stored?await db.reportRevision(reportId,userId):undefined;
+    if(revision===null)throw new Error("Report not found or expired");
+    if(!stored||revision!==stored.revision) {
+      stored=await db.getReport(reportId,userId);
+      if(!stored || stored.payload.kind==="raw")throw new Error("Report not found or expired");
+      result=calculate(stored.payload,resolve(stored.payload.spec,"list"));
+    }
+    const legacyRetry=!result.summary.figures_are_complete && stored.payload.verification_method!=="record-fields-v1";
+    if((!result.summary.continuation_available&&!legacyRetry) || Date.now()>=deadline || stoppingReports) return reportResponse(result,await db.reportJobStatus(reportId,userId));
+    if(!enqueued){await db.enqueueReport(reportId,userId);enqueued=true;}
+    const job=await db.claimReportJob(reportId,userId);
+    // This continues after a bounded response timeout. Its lease and snapshot
+    // are durable; the request never abandons an unrecorded page fetch.
+    if(job)resumeReportJob(job).catch(()=>console.error("[report] background batch failed"));
+    await delay(Math.min(200,Math.max(0,deadline-Date.now())));
+  }
+}
+export async function stopReportJobs(graceMs=7000) {
+  stoppingReports=true;
+  await Promise.race([Promise.allSettled([...activeReportJobs.values()]),delay(graceMs,undefined,{ref:false})]);
+  await db.releaseReportJobs([...activeReportJobs.keys()]);
 }
 async function autoReconcile(snapshot,userId,m) {
   const result=calculate(snapshot,m);
@@ -96,7 +125,13 @@ async function autoReconcile(snapshot,userId,m) {
     await db.recordEvent(userId,"reconciliation",comparison.status);return;
   }
 }
-export async function resumeReportJob(job) {
+export function resumeReportJob(job) {
+  if(stoppingReports)return db.releaseReportJobs([job.lease_token]);
+  const work=processReportJob(job).finally(()=>activeReportJobs.delete(job.lease_token));
+  activeReportJobs.set(job.lease_token,work);
+  return work;
+}
+async function processReportJob(job) {
   try {
     const user=await db.getUser(job.user_id);
     if(!user||!emailAllowed(user.email))throw new Error("Account access unavailable");
@@ -105,13 +140,13 @@ export async function resumeReportJob(job) {
     const s=stored.payload;
     selectOrganizations(await organizations(job.user_id),{organization_ids:s.organizations.map(o=>o.id)});
     const m=resolve(s.spec,"list");
-    await advanceSnapshot(s,m,q=>zohoRequest(job.user_id,q),integerSetting("REPORT_BACKGROUND_REQUESTS",2,1,10));
+    await advanceSnapshot(s,m,q=>zohoRequest(job.user_id,q),integerSetting("REPORT_BACKGROUND_REQUESTS",8,1,10));
     await autoReconcile(s,job.user_id,m);
     const transient=s.organizations.some(o=>o.errors.length&&!o.blocked);
     if(transient && job.failures>=4) {
       for(const org of s.organizations)if(org.errors.length&&!org.blocked){org.blocked=true;org.errors.push("Background retries exhausted; start a new report after access or service recovery");}
     }
-    await db.saveReport(job.report_id,job.user_id,s,stored.revision);
+    await db.saveJobReport(job,s,stored.revision);
     const next=calculate(s,m).summary;
     await db.finishReportJob(job,next.continuation_available?"queued":next.figures_are_complete?"complete":"failed",transient,Math.max(0,...s.organizations.map(o=>o.retry_after_ms||0)));
     if(!next.continuation_available)await db.recordEvent(job.user_id,"report",next.figures_are_complete?"complete":"failed");
@@ -121,7 +156,7 @@ export async function resumeReportJob(job) {
       const current=await db.getReport(job.report_id,job.user_id);
       if(current&&current.payload.kind!=="raw") {
         for(const org of current.payload.organizations)if(!org.verified){org.blocked=true;org.errors=["Background retries exhausted; restore access and start a new report"];}
-        await db.saveReport(job.report_id,job.user_id,current.payload,current.revision);
+        await db.saveJobReport(job,current.payload,current.revision);
       }
     }
     await db.finishReportJob(job,job.failures>=4?"failed":"queued",true);
@@ -166,16 +201,12 @@ add("list",
       records: rows }, userId);
   });
 
-add("continue_report", "Continue a stored report's remaining pages. Scope is fixed. Do not combine totals from successive calls; each response replaces the previous report summary.",
+add("continue_report", "Wait for a stored report to finish retrieving and verifying all pages, using its fixed scope. Call automatically when status is processing; do not ask the user to continue. Bounded wait returns a next_action if still processing. Never add successive summaries. Completed reports include the first 50 groups and a pointer to remaining groups.",
   { report_id: z.string().uuid() }, async ({ report_id }, userId) => {
     const stored = await db.getReport(report_id, userId);
     if (!stored || stored.payload.kind === "raw") return fail("Report not found or expired");
     selectOrganizations(await organizations(userId),{organization_ids:stored.payload.organizations.map(o=>o.id)});
-    await db.enqueueReport(report_id,userId);
-    const job=await db.claimReportJob(report_id,userId);
-    if(job)await resumeReportJob(job);
-    const latest=await db.getReport(report_id,userId);
-    return reply({...calculate(latest.payload,resolve(latest.payload.spec,"list")).summary,background_job:await db.reportJobStatus(report_id,userId)},userId);
+    return reply(await awaitReport(report_id,userId),userId);
   });
 
 add("report_definitions","Show the versioned calculation definitions, expected organization IDs, and which accounting interpretations remain unsupported. These definitions are not finance approval.",{},async()=>textResult({definitions:Object.values(DEFINITIONS),expected_organization_ids:expectedOrganizations(),finance_approval:"Requires operator-approved actual reference records"}));
@@ -244,22 +275,31 @@ add("get_report", "Read a stored report summary, every group, receipt evidence, 
     page: z.coerce.number().int().min(1).default(1), per_page: z.coerce.number().int().min(1).max(100).default(50),
     offset: z.coerce.number().int().min(0).default(0) },
   async ({ report_id, section, page, per_page, offset }, userId) => {
-    const stored = await db.getReport(report_id, userId);
+    let stored = await db.getReport(report_id, userId);
     if (!stored) return fail("Report not found or expired");
+    const waitsForResult=stored.payload.kind!=="raw" && ["summary","groups"].includes(section);
+    if(waitsForResult) {
+      selectOrganizations(await organizations(userId),{organization_ids:stored.payload.organizations.map(o=>o.id)});
+      await awaitReport(report_id,userId);
+      stored=await db.getReport(report_id,userId);
+      if(!stored)return fail("Report not found or expired");
+    }
     const snapshot = stored.payload;
-    let value;
+    let value, progress;
     if (snapshot.kind === "raw") value = snapshot.value;
     else {
-      selectOrganizations(await organizations(userId), { organization_ids: snapshot.organizations.map(o => o.id) });
+      if(!waitsForResult)selectOrganizations(await organizations(userId), { organization_ids: snapshot.organizations.map(o => o.id) });
       const result = calculate(snapshot, resolve(snapshot.spec, "list"));
-      value = section === "reconciliation_differences" ? snapshot.reconciliation_differences || [] : section === "summary" ? {...result.summary,retained_until:stored.expires_at,background_job:await db.reportJobStatus(report_id,userId)} : section === "source_records"
+      const response=reportResponse(result,await db.reportJobStatus(report_id,userId));
+      progress={status:response.status,figures_are_complete:response.figures_are_complete,reconciliation_status:response.reconciliation_status,next_action:response.status==="processing"?response.next_action:null};
+      value = section === "reconciliation_differences" ? snapshot.reconciliation_differences || [] : section === "summary" ? {...response,retained_until:stored.expires_at} : section === "source_records"
         ? snapshot.organizations.flatMap(o => o.rows.map(row => ({ organization_id: o.id, record: row })))
-        : result[section];
+        : section==="groups"&&!result.summary.figures_are_complete?null:result[section];
       if (value === undefined) return fail("Invalid report section");
     }
     const total = Array.isArray(value) ? value.length : undefined;
     const selected = Array.isArray(value) ? value.slice((page - 1) * per_page, page * per_page) : value;
-    const out = { report_id, section, page, total_records: total, data: selected,
+    const out = { report_id, section, page, ...progress, total_records: total, data: selected,
       ...(total > page * per_page && { next_page: page + 1 }) };
     const serialized = JSON.stringify(out);
     if (serialized.length <= limit() && offset === 0) return textResult(out);

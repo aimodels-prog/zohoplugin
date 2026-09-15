@@ -65,7 +65,7 @@ Use `get_report` with `section: "evidence"` for individual receipts; follow `nex
 
 ## Current customer receivables (v3.1)
 
-Use `ZohoBooks_receivables_report` with `organization_id`, `organization_ids`, or `all_organizations: true`. The default `currency_basis: "base"` uses Zoho?s recorded customer balance in each entity?s base currency. Foreign-currency contacts whose list response omits that field are read through the contact-detail endpoint; these reads also obey the configurable request budget (two per foreground/background batch by default). No new OAuth scopes or account reconnects are required for existing connections.
+Use `ZohoBooks_receivables_report` with `organization_id`, `organization_ids`, or `all_organizations: true`. The default `currency_basis: "base"` uses Zoho?s recorded customer balance in each entity?s base currency. Foreign-currency contacts whose list response omits that field are read through the contact-detail endpoint; these reads also obey the configurable background budget (eight requests per batch by default). No new OAuth scopes or account reconnects are required for existing connections.
 
 `get_report` section `groups` returns every customer, sorted by balance within each organization/currency; follow `next_page`. Active and inactive customers are included. Unused credits are not automatically subtracted, currencies are not combined, and historical dates are rejected. These are current Zoho customer balances, not reconstructed invoice-only balances or certified historical closing balances.
 
@@ -113,7 +113,7 @@ Reports expire after 30 days by default and hourly cleanup removes expired snaps
 ## Limits and operation
 
 - HTTP reads: 20-second attempt timeout, up to three attempts for transient failures. Writes are never automatically retried.
-- A report call performs up to ten API requests, including contact details when a required balance is missing from a list. Calls continue from encrypted state and use optimistic concurrency to reject conflicting updates.
+- Report calls wait up to REPORT_WAIT_SECONDS (20 by default, maximum 45) for durable background work. Batches use REPORT_BACKGROUND_REQUESTS (8 by default). A timeout returns processing and an explicit next_action; the same report keeps running. No fixed two-page stopping point exists. Scope checks and persistence add overhead to the wait window.
 - MAX_REPORT_RECORDS defaults to 100,000 per snapshot. Hitting it blocks a final total. Because date filtering is local, a shorter requested date range does not reduce upstream scanning. For organizations beyond this limit use a native export or raise the bound after capacity review.
 - MAX_API_BYTES defaults to 8 MB per upstream response. MAX_RESPONSE_CHARS defaults to 60,000; oversized output is stored and read through get_report.
 - Two concurrent MCP requests per user per process. For multiple replicas, put shared rate limits at the proxy. Stable encryption key and PostgreSQL are shared.
@@ -130,3 +130,11 @@ For the August incident, obtain the actual finance export, original tool inputs/
 ## Assurance and operations (v3.2)
 
 See [ASSURANCE.md](ASSURANCE.md) for reference import, coverage configuration, background recovery, secure exports and app-only deployment/backup procedures. Software tests are separate from real finance acceptance.
+
+## Complete report delivery (v3.3)
+
+The original two-request foreground budget produced 400-invoice checkpoints even when the background job later verified all 608 invoices. The report endpoint now saves the report and job atomically, waits for completion within a bounded window, and returns `status: processing` with an explicit `next_action` when more time is needed. Clients should follow that action automatically using the same report ID. This cannot force an external client to make another tool call, but prevents a checkpoint from masquerading as a finished result.
+
+Completed grouped reports include their first 50 verified groups, plus a pointer to page 2 when needed. All groups are calculated from the entire verified population before output pagination. Monetary customer/vendor groups sort by exact amount within organization/currency. Incomplete `get_report` group responses have `data: null`, not an empty ranking. Counts carry a warning that no outstanding amounts were calculated; summary/grouping requests require an explicit metric. Use `receivables_report` for customer outstanding balances and reserve invoice summaries for explicit invoice-only questions.
+
+Graceful shutdown drains active report jobs briefly and releases only this process's remaining leases. Snapshot writes require the current lease and revision, so late results cannot overwrite recovered work. Abrupt process death still uses the existing lease-expiry recovery. Rate-limit delays remain enforced.

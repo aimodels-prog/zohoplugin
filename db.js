@@ -311,10 +311,12 @@ export async function issueTokenPair({ accessToken, refreshToken, clientId, user
   } catch (error) { await client.query('ROLLBACK'); throw error; }
   finally { client.release(); }
 }
-export async function saveReport(id, userId, payload, revision = null) {
+export async function saveReport(id, userId, payload, revision = null, enqueue = false) {
   const value = encrypt(JSON.stringify(payload));
   if (revision === null) {
-    await pool.query("INSERT INTO report_snapshots(id,user_id,payload,expires_at) VALUES($1,$2,$3,now()+($4::int * interval '1 day'))", [id,userId,value,integerSetting("REPORT_RETENTION_DAYS",30,1,365)]);
+    const insert="INSERT INTO report_snapshots(id,user_id,payload,expires_at) VALUES($1,$2,$3,now()+($4::int * interval '1 day'))";
+    await pool.query(enqueue?`WITH saved AS (${insert} RETURNING id,user_id) INSERT INTO report_jobs(report_id,user_id) SELECT id,user_id FROM saved`:insert,
+      [id,userId,value,integerSetting("REPORT_RETENTION_DAYS",30,1,365)]);
   } else {
     const r = await pool.query("UPDATE report_snapshots SET payload=$3, revision=revision+1 WHERE id=$1 AND user_id=$2 AND revision=$4 AND expires_at>now()", [id,userId,value,revision]);
     if (!r.rowCount) throw new Error('Report changed in another request; reload it');
@@ -323,6 +325,21 @@ export async function saveReport(id, userId, payload, revision = null) {
 export async function getReport(id, userId) {
   const { rows } = await pool.query('SELECT payload,revision,expires_at FROM report_snapshots WHERE id=$1 AND user_id=$2 AND expires_at>now()', [id,userId]);
   return rows[0] ? { payload: JSON.parse(decrypt(rows[0].payload)), revision: rows[0].revision, expires_at: rows[0].expires_at } : null;
+}
+export async function reportRevision(id,userId) {
+  const {rows}=await pool.query('SELECT revision FROM report_snapshots WHERE id=$1 AND user_id=$2 AND expires_at>now()',[id,userId]);
+  return rows[0]?.revision ?? null;
+}
+export async function saveJobReport(job,payload,revision) {
+  const r=await pool.query(`UPDATE report_snapshots s SET payload=$4,revision=s.revision+1 FROM report_jobs j
+    WHERE s.id=$1 AND s.user_id=$2 AND s.revision=$5 AND s.expires_at>now()
+    AND j.report_id=s.id AND j.user_id=s.user_id AND j.lease_token=$3 AND j.state='running' AND j.lease_until>now()`,
+    [job.report_id,job.user_id,job.lease_token,encrypt(JSON.stringify(payload)),revision]);
+  if(!r.rowCount)throw new Error('Report lease or revision changed; reload it');
+}
+export async function releaseReportJobs(tokens) {
+  if(!tokens.length)return;
+  await pool.query("UPDATE report_jobs SET state='queued',lease_token=NULL,lease_until=NULL,run_after=now(),updated_at=now() WHERE lease_token=ANY($1::text[]) AND state='running'",[tokens]);
 }
 export async function saveReference(id, userId, key, payload) {
   await pool.query('INSERT INTO finance_references(id,user_id,match_key,payload) VALUES($1,$2,$3,$4)',[id,userId,key,encrypt(JSON.stringify(payload))]);

@@ -59,7 +59,8 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     await assert.rejects(db.issueTokenPair({ accessToken: atomic.access_token, refreshToken: "replacement", clientId: "c", userId: "test-user", scopes: ["zoho_books"], resource: "https://mcp.example.test/mcp", oldRefresh: atomic.refresh_token }));
     assert.ok(await db.getToken(atomic.refresh_token), "failed issuance must roll back consumption");
 
-    let writes = 0; let currentName = "Original";
+    let writes = 0; let currentName = "Original";let invoiceReads=0;let invoiceRetry=false;let invoiceGate,invoiceStarted;
+    const invoiceRows=Array.from({length:608},(_,i)=>({invoice_id:String(i),customer_id:i===607?'late-winner':'c'+String(i%60).padStart(2,'0'),customer_name:i===607?'Late winner':'Synthetic customer '+i%60,currency_code:'OMR',balance:i===607?'1000':'1',bcy_balance:i===607?'1000':'1'}));
     let accessibleOrgs=[{organization_id:"om",name:"Oman",currency_code:"OMR",time_zone:"Asia/Muscat"}];
     global.fetch = async (url, options = {}) => {
       url = new URL(url);
@@ -75,6 +76,12 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
         { payment_id: "1", date: "2026-08-01", amount: "200", bcy_amount: "80.123" },
         { payment_id: "2", date: "2026-08-31", currency_code: "OMR", amount: "1.234", bcy_amount: "1.234" },
       ], page_context: { has_more_page: false } });
+      if(url.pathname.endsWith('/invoices')) {
+        if(invoiceGate){invoiceStarted();await invoiceGate;}
+        if(invoiceRetry)return Response.json({code:45},{status:429,headers:{'Retry-After':'120'}});
+        const page=Number(url.searchParams.get('page'));const rows=invoiceReads++%8<4?invoiceRows:[...invoiceRows].reverse();
+        return Response.json({code:0,invoices:rows.slice((page-1)*200,page*200),page_context:{page,has_more_page:page<4}});
+      }
       if ((options.method || "GET") !== "GET") { writes++; return Response.json({ code: 0, contact: { contact_id: "1", contact_name: "Created" } }); }
       return Response.json({ code: 0, contact: { contact_id: "1", contact_name: currentName } });
     };
@@ -88,6 +95,16 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     const ranked = payload(await call("get_report", { report_id: receivables.report_id, section: "groups" }));
     assert.equal(ranked.data[0].group_id, "c1");
     assert.equal(ranked.data[0].rank_in_organization_currency, 1);
+    await assert.rejects(call('list',{module:'invoices',organization_id:'om',summarize:true,group_by:'customer'}),/explicit metric/);
+    const fullInvoices=payload(await call('list',{module:'invoices',organization_id:'om',summarize:true,group_by:'customer',metric:'balance',currency_basis:'base'}));
+    assert.equal(fullInvoices.status,'complete');assert.equal(fullInvoices.record_count,608);assert.equal(invoiceReads,8);
+    assert.equal(fullInvoices.organizations[0].pages,4);assert.equal(fullInvoices.organizations[0].verification_pages,4);
+    assert.equal(fullInvoices.totals[0].amount.exact,'1607');assert.equal(fullInvoices.groups[0].group_id,'late-winner');
+    assert.equal(fullInvoices.groups[0].rank_in_organization_currency,1);assert.equal(fullInvoices.groups_complete,false);
+    const moreGroups=payload(await call('get_report',fullInvoices.next_action.arguments));
+    assert.equal(moreGroups.data.length,11);assert.equal(moreGroups.total_records,61);assert.equal(moreGroups.figures_are_complete,true);
+    const countOnly=payload(await call('list',{module:'invoices',organization_id:'om',summarize:true,group_by:'customer',metric:'count'}));
+    assert.equal(countOnly.amounts_calculated,false);assert.equal(countOnly.tool_for_customer_receivables.tool,'ZohoBooks_receivables_report');
     await assert.rejects(call("receivables_report", { organization_id: "om", as_of: "2026-08-31" }));
     assert.equal(await db.getReport(summary.report_id, "other-user"), null);
     assert.equal(payload(await call("get_report", { report_id: summary.report_id, section: "evidence" })).data.length, 2);
@@ -151,6 +168,11 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "ZohoBooks_collections_report", arguments: { organization_id: "om", date_start: "2026-08-01", date_end: "2026-08-31", filter_by: "ignored-filter" } } }) });
     const invalidResult = await invalidCall.json();
     assert.ok(invalidResult.error || invalidResult.result?.isError);
+    const invoiceMcp=await originalFetch(origin+'/mcp',{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',Authorization:'Bearer '+auth.access_token},
+      body:JSON.stringify({jsonrpc:'2.0',id:4,method:'tools/call',params:{name:'ZohoBooks_list',arguments:{module:'invoices',organization_id:'om',summarize:true,group_by:'customer',metric:'balance',currency_basis:'base'}}})});
+    const invoiceMcpResult=payload((await invoiceMcp.json()).result);
+    assert.equal(invoiceMcpResult.status,'complete');assert.equal(invoiceMcpResult.record_count,608);
+    assert.equal(invoiceMcpResult.groups[0].group_id,'late-winner');
 
     // References below are synthetic integration data, not real finance acceptance.
     const {referenceKey}=await import("../finance-reference.js");
@@ -166,10 +188,15 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     assert.ok(new Date((await db.getReport(automatic.report_id,"test-user")).expires_at)-Date.now()>29*86400000);
 
     // Exercise lease ownership, expiry recovery and upstream backoff in real SQL.
-    process.env.REPORT_FOREGROUND_REQUESTS="1";
+    process.env.REPORT_WAIT_SECONDS="0";
     const pending=payload(await call("collections_report",{organization_id:"om",date_start:"2026-08-01",date_end:"2026-08-31"}));
-    delete process.env.REPORT_FOREGROUND_REQUESTS;
+    delete process.env.REPORT_WAIT_SECONDS;
     assert.equal(pending.figures_are_complete,false);
+    assert.equal(pending.status,'processing');assert.equal(pending.next_action.arguments.report_id,pending.report_id);
+    process.env.REPORT_WAIT_SECONDS='0';
+    const incompleteGroups=payload(await call('get_report',{report_id:pending.report_id,section:'groups'}));
+    delete process.env.REPORT_WAIT_SECONDS;
+    assert.equal(incompleteGroups.data,null);assert.equal(incompleteGroups.status,'processing');
     assert.equal(await db.claimReportJob(pending.report_id,"other-user"),null);
     const jobClaims=await Promise.all([db.claimReportJob(pending.report_id,"test-user"),db.claimReportJob(pending.report_id,"test-user")]);
     assert.equal(jobClaims.filter(Boolean).length,1);
@@ -177,6 +204,8 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     await pool.query("UPDATE report_jobs SET lease_until=now()-interval '1 second' WHERE report_id=$1",[pending.report_id]);
     const recovered=await db.claimReportJob(pending.report_id,"test-user");
     assert.notEqual(recovered.lease_token,abandoned.lease_token);
+    const leasedSnapshot=await db.getReport(pending.report_id,'test-user');
+    await assert.rejects(db.saveJobReport(abandoned,leasedSnapshot.payload,leasedSnapshot.revision),/lease/);
     await db.finishReportJob(abandoned,"failed");
     assert.equal((await db.reportJobStatus(pending.report_id,"test-user")).state,"running");
     await db.finishReportJob(recovered,"queued",true,120000);
@@ -185,6 +214,18 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     await resumeReportJob(await db.claimReportJob(pending.report_id,"test-user"));
     assert.equal((await db.reportJobStatus(pending.report_id,"test-user")).state,"complete");
     assert.equal(payload(await call("get_report",{report_id:pending.report_id})).data.figures_are_complete,true);
+    // A rate-limited batch yields durably without a false final result or a busy retry loop.
+    process.env.REPORT_WAIT_SECONDS='0';
+    const throttled=payload(await call('list',{module:'invoices',organization_id:'om',summarize:true,metric:'balance'}));
+    invoiceRetry=true;
+    await resumeReportJob(await db.claimReportJob(throttled.report_id,'test-user'));
+    const beforeRetry=await db.reportJobStatus(throttled.report_id,'test-user');
+    assert.equal(beforeRetry.state,'queued');assert.ok(new Date(beforeRetry.run_after)-Date.now()>110000);
+    assert.equal((await call('continue_report',{report_id:throttled.report_id})).isError,false);
+    assert.equal(await db.claimReportJob(throttled.report_id,'test-user'),null);
+    invoiceRetry=false;delete process.env.REPORT_WAIT_SECONDS;
+    await pool.query('UPDATE report_jobs SET run_after=now() WHERE report_id=$1',[throttled.report_id]);
+    assert.equal(payload(await call('continue_report',{report_id:throttled.report_id})).figures_are_complete,true);
 
     process.env.PUBLIC_URL=origin;
     assert.equal((await call("export_report",{report_id:automatic.report_id},"other-user")).isError,true);
@@ -215,27 +256,27 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     assert.equal((await question("Net collections for August 2026",{organization_id:"om"}))[0].status,"needs_clarification");
     process.env.EXPECTED_ORGANIZATION_IDS="om,ae,sa,qa,bh";
     accessibleOrgs=["om","ae","sa","qa","bh"].map(organization_id=>({organization_id,name:"Synthetic "+organization_id,currency_code:"OMR",time_zone:"Asia/Muscat"}));
-    process.env.REPORT_FOREGROUND_REQUESTS="10";
+    process.env.REPORT_WAIT_SECONDS="10";
     await assert.rejects(call("receivables_report",{all_organizations:true,organization_id:"om"}),/exactly one/);
     const all=(await question("Outstanding receivables for all five entities"))[1];
     assert.equal(all.entity_coverage.status,"all_expected_entities_covered");assert.equal(all.totals.length,5);
     accessibleOrgs=accessibleOrgs.slice(1);
     await assert.rejects(call("receivables_report",{all_organizations:true}),/accessible|access/i);
-    delete process.env.EXPECTED_ORGANIZATION_IDS;delete process.env.REPORT_FOREGROUND_REQUESTS;
+    delete process.env.EXPECTED_ORGANIZATION_IDS;delete process.env.REPORT_WAIT_SECONDS;
     await assert.rejects(call("receivables_report",{all_organizations:true}),/not configured/);
     accessibleOrgs=reference.organizations;
-    process.env.REPORT_FOREGROUND_REQUESTS="1";
+    process.env.REPORT_WAIT_SECONDS="0";
     const doomed=payload(await call("collections_report",{organization_id:"om",date_start:"2026-08-01",date_end:"2026-08-31"}));
-    delete process.env.REPORT_FOREGROUND_REQUESTS;
+    delete process.env.REPORT_WAIT_SECONDS;
     await pool.query("UPDATE report_jobs SET failures=4 WHERE report_id=$1",[doomed.report_id]);
     await pool.query("UPDATE users SET email='revoked@revoked.test' WHERE id='test-user'");
     await resumeReportJob(await db.claimReportJob(doomed.report_id,"test-user"));
     assert.equal((await db.reportJobStatus(doomed.report_id,"test-user")).state,"failed");
     assert.equal((await db.getReport(doomed.report_id,"test-user")).payload.organizations[0].blocked,true);
     await pool.query("UPDATE users SET email='finance@example.test' WHERE id='test-user'");
-    process.env.REPORT_FOREGROUND_REQUESTS="1";
+    process.env.REPORT_WAIT_SECONDS="0";
     const background=payload(await call("collections_report",{organization_id:"om",date_start:"2026-08-01",date_end:"2026-08-31"}));
-    delete process.env.REPORT_FOREGROUND_REQUESTS;
+    delete process.env.REPORT_WAIT_SECONDS;
     const {startReportWorker}=await import("../report-worker.js");
     const stopWorker=startReportWorker(resumeReportJob,10);
     try {
@@ -243,6 +284,28 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
       while((await db.reportJobStatus(background.report_id,"test-user")).state!=="complete"&&Date.now()<deadline)await new Promise(r=>setTimeout(r,20));
       assert.equal((await db.reportJobStatus(background.report_id,"test-user")).state,"complete");
     } finally {stopWorker();}
+    // Shutdown releases only this process's owned leases. Late work cannot save
+    // after release, even if no other worker has modified the snapshot revision.
+    process.env.REPORT_WAIT_SECONDS='0';
+    const interrupted=payload(await call('list',{module:'invoices',organization_id:'om',summarize:true,metric:'balance'}));
+    delete process.env.REPORT_WAIT_SECONDS;
+    let unblock;invoiceGate=new Promise(resolve=>unblock=resolve);
+    const started=new Promise(resolve=>invoiceStarted=resolve);
+    const interruptedJob=await db.claimReportJob(interrupted.report_id,'test-user');
+    const inFlight=resumeReportJob(interruptedJob);
+    await started;
+    process.env.REPORT_WAIT_SECONDS='1';
+    const waitStarted=Date.now();
+    const checkpoint=payload(await call('continue_report',{report_id:interrupted.report_id}));
+    delete process.env.REPORT_WAIT_SECONDS;
+    assert.ok(Date.now()-waitStarted<3000,'a slow Zoho request must not hold the MCP response indefinitely');
+    assert.equal(checkpoint.status,'processing');assert.equal(checkpoint.next_action.arguments.report_id,interrupted.report_id);
+    assert.equal((await db.reportJobStatus(interrupted.report_id,'test-user')).state,'running');
+    const {stopReportJobs}=await import('../tools.js');await stopReportJobs(0);
+    assert.equal((await db.reportJobStatus(interrupted.report_id,'test-user')).state,'queued');
+    unblock();await inFlight;invoiceGate=undefined;
+    assert.equal((await db.getReport(interrupted.report_id,'test-user')).revision,0);
+    assert.equal((await db.reportJobStatus(interrupted.report_id,'test-user')).state,'queued');
     await db.cleanup();
   } finally {
     global.fetch = originalFetch;

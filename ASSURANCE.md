@@ -1,6 +1,6 @@
 # Financial assurance and operation
 
-Version 3.2 implements eight improvements. Software validation and finance acceptance remain separate: no real approved exports or five-entity registry were available during implementation. Neither passing tests nor two matching API reads guarantees 100% accounting accuracy.
+Version 3.2 introduced eight improvements; v3.3 adds complete-report delivery and lease-checked shutdown recovery. Software validation and finance acceptance remain separate: no real approved exports or five-entity registry were available during implementation. Neither passing tests nor two matching API reads guarantees 100% accounting accuracy.
 
 | Improvement | Implementation | Production prerequisite |
 |---|---|---|
@@ -43,7 +43,7 @@ For regression replay, provide a private `FINANCE_FIXTURE_DIR` with JSON files c
 
 ## Background work and monitoring
 
-Jobs are stored in PostgreSQL. Atomic leases prevent simultaneous continuations from claiming the same job, and expired leases can be recovered after a restart. Revision checks prevent stale saves. Each batch defaults to two source requests. Transient failures have bounded retries; long upstream Retry-After delays are preserved. Source-field mismatches still fail verification. Request pacing is per organization/API origin within this process; it is not a distributed quota governor for multiple app replicas.
+Jobs are stored in PostgreSQL. Atomic leases prevent simultaneous continuations from claiming the same job, and expired leases can be recovered after a restart. Revision checks prevent stale saves. Each batch defaults to eight source requests. Foreground calls wait up to 20 seconds for completion and return explicit continuation instructions if needed. Transient failures have bounded retries; long upstream Retry-After delays are preserved. Source-field mismatches still fail verification. Request pacing is per organization/API origin within this process; it is not a distributed quota governor for multiple app replicas.
 
 `npm run monitor` checks database access, each linked account's Zoho access, expected-entity coverage and job outcomes. It prints structured status without financial records or tokens and exits nonzero when attention is required. `connector_status` exposes only the caller's status. `/health` remains the lightweight database health endpoint. Systemd records monitoring failures in the journal; external notification delivery is not configured or sent by this release.
 

@@ -5,7 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import tools, { resumeReportJob } from "./tools.js";
+import tools, { resumeReportJob, stopReportJobs } from "./tools.js";
 import { startReportWorker } from "./report-worker.js";
 import { READ_ONLY, VERSION, BUILD_ID, integerSetting } from "./security.js";
 import * as db from "./db.js";
@@ -125,7 +125,8 @@ async function main() {
   for (const signal of ["SIGTERM", "SIGINT"]) process.once(signal, () => {
     clearInterval(timer);
     stopWorker();
-    server.close(() => db.close().then(() => process.exit(0)));
+    server.close();
+    stopReportJobs().then(()=>db.close()).then(()=>process.exit(0)).catch(()=>process.exit(1));
     setTimeout(() => process.exit(1), 10000).unref();
   });
 }

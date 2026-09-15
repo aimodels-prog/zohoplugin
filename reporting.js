@@ -179,6 +179,7 @@ export async function advanceSnapshot(snapshot, module, read, budget = 10) {
   };
   for (const org of snapshot.organizations) {
     if (org.verified || org.blocked) continue;
+    if (budget <= 0) break; // Preserve errors/backoff for entities not visited in this batch.
     if(snapshot.spec.metric==="balance"&&snapshot.spec.as_of&&snapshot.spec.as_of!==currentDate(org.time_zone||"UTC")) {
       org.blocked=true;org.errors=["The requested aging calendar day is no longer current; use a historical source or start a new report"];continue;
     }
@@ -350,14 +351,14 @@ export function calculate(snapshot, module) {
   const present = map => [...map.values()].map(({ sum, ...bucket }) => ({ ...bucket,
     ...(spec.metric !== "count" && { amount: formatted(sum, bucket.currency) }) }));
   const rankedGroups = complete ? present(groups) : [];
-  if (spec.kind === "receivables") {
+  if (["customer","vendor"].includes(spec.group_by) && spec.metric!=="count") {
     rankedGroups.sort((a, b) => a.organization_id.localeCompare(b.organization_id) || a.currency.localeCompare(b.currency) || money(b.amount.exact).cmp(money(a.amount.exact)) || a.group_id.localeCompare(b.group_id));
     let scope, rank = 0;
     for (const group of rankedGroups) { const key = JSON.stringify([group.organization_id, group.currency]); if (key !== scope) { scope = key; rank = 0; } group.rank_in_organization_currency = ++rank; }
   }
   return {
     summary: { report_id: snapshot.id, version: snapshot.version, build_id: snapshot.build_id, specification: spec,
-      ...(snapshot.definition && {definition:snapshot.definition}),
+      ...(snapshot.definition && {financial_definition:snapshot.definition}),
       ...(snapshot.entity_coverage && {entity_coverage:snapshot.entity_coverage}),
       ...(snapshot.reference_check && {reference_check:snapshot.reference_check}),
       started_at: snapshot.started_at, finished_at: snapshot.finished_at,
