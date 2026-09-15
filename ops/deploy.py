@@ -28,6 +28,11 @@ archive=stage/'release.tar.gz'
 urllib.request.urlretrieve('https://codeload.github.com/aimodels-prog/zohoplugin/tar.gz/'+commit,archive)
 with tarfile.open(archive) as t:t.extractall(stage,filter='data')
 src=stage/('zohoplugin-'+commit)
+# tarfile's data filter leaves directory modes to the restrictive process umask.
+# Source directories copied into the image must be traversable by USER node.
+src.chmod(0o755)
+for directory in src.rglob('*'):
+ if directory.is_dir():directory.chmod(0o755)
 version=json.loads((src/'package.json').read_text())['version']
 shutil.copy2(root/'.env',src/'.env')
 text=(src/'.env').read_text()
@@ -39,6 +44,7 @@ cfg=json.loads(out(compose+['config','--format','json']))
 for key in ['DATABASE_URL','TOKEN_ENCRYPTION_KEY','PUBLIC_URL','ZOHO_CLIENT_ID','ZOHO_CLIENT_SECRET','ZOHO_READ_ONLY','ALLOWED_EMAIL_DOMAINS']:
  assert str(cfg['services']['app']['environment'][key])==oldenv[key], 'Preserved setting mismatch: '+key
 run(compose+['build','app'])
+run(['docker','run','--rm','zoho-books-mcp-app:latest','node','--input-type=module','-e',"import {accessSync,constants} from 'node:fs';for(const file of ['scripts/monitor.mjs','scripts/finance-admin.mjs','scripts/check-finance-fixtures.mjs'])accessSync(file,constants.R_OK);"])
 expected_tools=int(out(['docker','run','--rm','-e','ZOHO_READ_ONLY='+oldenv['ZOHO_READ_ONLY'],'zoho-books-mcp-app:latest','node','--input-type=module','-e',"import tools from './tools.js';console.log(tools.length);process.exit(0)"]))
 print('Build complete; backing up application',flush=True)
 with tarfile.open(backup/'source.tar.gz','w:gz') as t:t.add(root,arcname='zoho-mcp')
