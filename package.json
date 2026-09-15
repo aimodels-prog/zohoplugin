@@ -1,6 +1,6 @@
 {
   "name": "zoho-books-mcp",
-  "version": "3.3.1",
+  "version": "3.3.2",
   "private": true,
   "type": "module",
   "description": "Multi-user Zoho Books MCP with validated financial reports",
@@ -10,7 +10,8 @@
     "check": "node check.js",
     "test": "node --test",
     "test:finance": "node scripts/check-finance-fixtures.mjs",
-    "monitor": "node scripts/monitor.mjs"
+    "monitor": "node scripts/monitor.mjs",
+    "smoke:reports": "node scripts/smoke-reports.mjs"
   },
   "engines": {
     "node": ">=22"

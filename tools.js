@@ -13,7 +13,8 @@ import { createDownloadTicket } from "./report-export.js";
 import { emailAllowed } from "./oauth.js";
 import { reportResponse } from "./report-response.js";
 import { setTimeout as delay } from "node:timers/promises";
-import { listParamsSchema, normalizeListArgs, compatibleListResult } from "./list-compat.js";
+import { listParamsSchema, normalizeListArgs, compatibleListResult, compatibleListValue } from "./list-compat.js";
+import { diagnostic } from './diagnostics.js';
 
 const tools = [];
 const add = (name, description, schema, run, write = false) => {
@@ -150,7 +151,11 @@ async function processReportJob(job) {
     await db.saveJobReport(job,s,stored.revision);
     const next=calculate(s,m).summary;
     await db.finishReportJob(job,next.continuation_available?"queued":next.figures_are_complete?"complete":"failed",transient,Math.max(0,...s.organizations.map(o=>o.retry_after_ms||0)));
-    if(!next.continuation_available)await db.recordEvent(job.user_id,"report",next.figures_are_complete?"complete":"failed");
+    if(!next.continuation_available) {
+      const info=next.figures_are_complete?{report_id:job.report_id}:diagnostic('verification_failed',job.report_id);
+      if(!next.figures_are_complete)console.error(JSON.stringify({category:'report_failure',...info}));
+      await db.recordEvent(job.user_id,"report",next.figures_are_complete?"complete":"failed",0,info);
+    }
     return next;
   } catch {
     if(job.failures>=4) {
@@ -161,7 +166,9 @@ async function processReportJob(job) {
       }
     }
     await db.finishReportJob(job,job.failures>=4?"failed":"queued",true);
-    await db.recordEvent(job.user_id,"report_job","error");
+    const info=diagnostic('report_job_error',job.report_id);
+    console.error(JSON.stringify({category:'report_job_failure',...info}));
+    await db.recordEvent(job.user_id,"report_job","error",0,info);
   }
 }
 add("collections_report",
@@ -202,7 +209,8 @@ async function runList(args,userId) {
       if(args.metric||args.group_by||args.date_start||args.date_end||args.as_of||args.statuses||args.customer_id||args.vendor_id||args.search_text||args.summarize||args.entity||args.module_api_name||args.currency_basis)return fail("Saved report criteria cannot be changed");
       const tool=tools.find(t=>t.name==='ZohoBooks_'+(args.section?'get_report':'continue_report'));
       const query={report_id:args.report_id,...(args.section&&{section:args.section,page:args.page,per_page:args.per_page,offset:args.offset})};
-      return tool.run(z.object(tool.schema).strict().parse(query),userId);
+      const parsed=z.object(tool.schema).strict().parse(query);
+      return args.section?readReport(parsed,userId,args.module):tool.run(parsed,userId);
     }
     if(args.report_type==='receivables') {
       if(args.module!=='contacts')return fail("Customer receivables require module: contacts; invoice-only balances require metric: balance without report_type: receivables");
@@ -311,7 +319,9 @@ add("get_report", "Read a stored report summary, every group, receipt evidence, 
   { report_id: z.string().uuid(), section: z.enum(["summary", "evidence", "groups", "exclusions", "validation_errors", "source_records", "reconciliation_differences", "raw"]).default("summary"),
     page: z.coerce.number().int().min(1).default(1), per_page: z.coerce.number().int().min(1).max(200).default(50),
     offset: z.coerce.number().int().min(0).default(0) },
-  async ({ report_id, section, page, per_page, offset }, userId) => {
+  (args,userId)=>readReport(args,userId));
+
+async function readReport({ report_id, section, page, per_page, offset }, userId, legacyModule=null) {
     let stored = await db.getReport(report_id, userId);
     if (!stored) return fail("Report not found or expired");
     const waitsForResult=stored.payload.kind!=="raw" && ["summary","groups"].includes(section);
@@ -338,13 +348,14 @@ add("get_report", "Read a stored report summary, every group, receipt evidence, 
     const selected = Array.isArray(value) ? value.slice((page - 1) * per_page, page * per_page) : value;
     const out = { report_id, section, page, ...progress, total_records: total, data: selected,
       ...(total > page * per_page && { next_page: page + 1 }) };
+    if(legacyModule)compatibleListValue(out,{module:legacyModule,per_page});
     const serialized = JSON.stringify(out);
     if (serialized.length <= limit() && offset === 0) return textResult(out);
     const size = Math.floor((limit() - 1500) / 6); // Worst-case JSON string escaping.
     return textResult({ report_id, section, page, format: "JSON text fragment", total_characters: serialized.length,
       offset, fragment: serialized.slice(offset, offset + size),
       ...(offset + size < serialized.length ? { next_offset: offset + size } : { next_page: out.next_page }) });
-  });
+}
 
 add("get", "Retrieve a record with explicit organization and ID. Financial amounts retain source currency semantics; this record alone is not a complete report.",
   { ...recordArgs, record_id: id },

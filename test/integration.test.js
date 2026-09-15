@@ -172,6 +172,13 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "ZohoBooks_collections_report", arguments: { organization_id: "om", date_start: "2026-08-01", date_end: "2026-08-31", filter_by: "ignored-filter" } } }) });
     const invalidResult = await invalidCall.json();
     assert.ok(invalidResult.error || invalidResult.result?.isError);
+    assert.equal(payload(invalidResult.result).code,'schema_error');
+    const afterSchemaError=await db.operationalStatus('test-user');
+    assert.ok(afterSchemaError.recent_failures.some(f=>f.outcome==='schema_error'&&f.reference_id===payload(invalidResult.result).reference));
+    assert.equal((await db.operationalStatus('other-user')).recent_failures.length,0);
+    const unknownCall=await originalFetch(origin+'/mcp',{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',Authorization:'Bearer '+auth.access_token},body:JSON.stringify({jsonrpc:'2.0',id:22,method:'tools/call',params:{name:'private-not-a-real-tool',arguments:{private_value:'never-log-this'}}})});
+    const unknownBody=await unknownCall.json();
+    assert.equal(payload(unknownBody.result).code,'unknown_tool');assert.equal(JSON.stringify(unknownBody).includes('private-not-a-real-tool'),false);
     const invoiceMcp=await originalFetch(origin+'/mcp',{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',Authorization:'Bearer '+auth.access_token},
       body:JSON.stringify({jsonrpc:'2.0',id:4,method:'tools/call',params:{name:'ZohoBooks_list',arguments:{module:'invoices',organization_id:'om',summarize:true,group_by:'customer',metric:'balance',currency_basis:'base'}}})});
     const invoiceMcpResult=payload((await invoiceMcp.json()).result);
@@ -210,6 +217,20 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     await assert.rejects(call('list',{module:'invoices',organization_id:'om',params:{filter_by:'Status.Unpaid'}}));
     assert.equal((await call('list',{module:'contacts',organization_id:'om',params:{report_type:'receivables',date_start:'2026-08-01'}})).isError,true);
     assert.equal((await call('list',{module:'invoices',organization_id:'om',params:{report_type:'receivables'}})).isError,true);
+
+    // Reassemble genuinely oversized summaries and customer pages using only
+    // the original list tool; controls inside saved raw responses must work.
+    const {legacyReportClient}=await import('../report-client.js');
+    const acceptanceClient=legacyReportClient(async params=>{
+      oldListSchema.parse(params.arguments);
+      const r=await originalFetch(origin+'/mcp',{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',Authorization:'Bearer '+auth.access_token},body:JSON.stringify({jsonrpc:'2.0',id:23,method:'tools/call',params})});
+      const body=await r.json();assert.ok(!body.error);return body.result;
+    });
+    process.env.MAX_RESPONSE_CHARS='4000';
+    try {
+      const checked=await acceptanceClient.run({module:'invoices',organization_id:'om',group_by:'customer',params:{metric:'balance',currency_basis:'base'}});
+      assert.equal(checked.record_count,608);assert.equal(checked.groups_read,61);assert.ok(checked.calls>4,'must exercise saved responses and multiple fragments');
+    } finally {delete process.env.MAX_RESPONSE_CHARS;}
 
     // References below are synthetic integration data, not real finance acceptance.
     const {referenceKey}=await import("../finance-reference.js");
@@ -312,6 +333,10 @@ test("Postgres migration, OAuth, report isolation, MCP and write lifecycle", { s
     assert.equal((await db.getReport(doomed.report_id,"test-user")).payload.organizations[0].blocked,true);
     await pool.query("UPDATE users SET email='finance@example.test' WHERE id='test-user'");
     process.env.REPORT_WAIT_SECONDS="0";
+    const failedReportRead=await originalFetch(origin+'/mcp',{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',Authorization:'Bearer '+auth.access_token},body:JSON.stringify({jsonrpc:'2.0',id:24,method:'tools/call',params:{name:'ZohoBooks_list',arguments:{module:'customer_payments',params:{report_id:doomed.report_id,section:'summary'}}}})});
+    const failedReportBody=await failedReportRead.json();
+    assert.equal(payload(failedReportBody.result).data.status,'failed_validation');
+    assert.ok((await db.operationalStatus('test-user')).recent_failures.some(f=>f.outcome==='verification_failed'&&f.report_id===doomed.report_id));
     const background=payload(await call("collections_report",{organization_id:"om",date_start:"2026-08-01",date_end:"2026-08-31"}));
     delete process.env.REPORT_WAIT_SECONDS;
     const {startReportWorker}=await import("../report-worker.js");

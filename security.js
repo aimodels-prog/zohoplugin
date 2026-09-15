@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
 export const READ_ONLY = process.env.ZOHO_READ_ONLY?.toLowerCase() !== "false";
-export const VERSION = "3.3.1";
+export const VERSION = "3.3.2";
 export const BUILD_ID = process.env.BUILD_ID || "development";
 export function integerSetting(name, fallback, min = 1, max = 1000000) {
   const value = Number(process.env[name] ?? fallback);

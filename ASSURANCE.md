@@ -1,6 +1,6 @@
 # Financial assurance and operation
 
-Version 3.2 introduced eight improvements; v3.3 adds complete-report delivery and lease-checked shutdown recovery. Software validation and finance acceptance remain separate: no real approved exports or five-entity registry were available during implementation. Neither passing tests nor two matching API reads guarantees 100% accounting accuracy.
+Version 3.2 introduced eight improvements; v3.3 adds complete-report delivery and lease-checked shutdown recovery. Software validation and finance acceptance remain separate. The live five-entity registry has been configured; real approved reference exports remain outstanding. Neither passing tests nor two matching API reads guarantees 100% accounting accuracy.
 
 | Improvement | Implementation | Production prerequisite |
 |---|---|---|
@@ -62,3 +62,13 @@ The deployer takes an application-specific lock, builds the pinned release befor
 The installer enables only the three `zoho-mcp-*` timers. Daily backups and weekly restore drills write protected directories under `/opt/via/zoho-mcp-backups`. Restore drills use a temporary container with no network or published ports and verify that restored credentials decrypt with the retained application key. A disk-space guard stops backups before consuming the last reserve. Backups are not automatically deleted; an operator must manage retention and separately protected/off-host copies. Keeping the key beside a local dump supports recovery but does not protect against loss of the server itself.
 
 Live deployment, timer execution, restore-drill results, actual entity registration and finance acceptance must each be checked and reported separately. Prepared scripts are not evidence that those production actions ran.
+
+## Release acceptance and diagnostics (v3.3.2)
+
+Before accepting a release, test the original `ZohoBooks_list` reporting contract through the public authenticated MCP endpoint. `npm run smoke:reports -- EXISTING_ACCOUNT_ID INVOICE_ORGANIZATION_ID` runs invoice balance ranking for that entity and current customer receivables for the configured five entities. It follows the same report through continuation, stored-response pointers, fragments and every customer page. It rejects incomplete verification, changed continuation IDs, malformed fragments, duplicate/missing groups, incorrect ordering and group totals that disagree with the report. It prints counts, report IDs and verification labels, without customer names or amounts. The temporary access token is deleted in `finally`; existing credentials are preserved. This emulates an older client contract; it cannot inspect a ChatGPT workspace's approved tools or prove how a live conversation chooses tools.
+
+The Contabo deployer reads an operator configuration at `/opt/via/zoho-mcp-release-check.json` with exactly `user_id` and `invoice_organization_id`. When configured, public report checks are required after app replacement and health checks; a failure triggers app/source rollback. `report-acceptance.json` records the check result. Without this configuration the deployment result explicitly says `not_configured`, not passed. Configure only an existing authorized account with access to the agreed five entities. Upstream outages and continuously changing source records can legitimately fail this gate; diagnose the recorded failure before retrying a release.
+
+Schema validation failures are captured before the SDK callback, with safe field paths and correction guidance. Tool errors, failed verification, concurrency limits and background failures carry references and release IDs. Monitoring reports recent failures even when HTTP returned 200 or background jobs later recovered; these are a 24-hour history, not a claim that each failure is still active. Stored diagnostics omit argument values, customer text, credentials and raw error messages. No automatic email or chat notifications are sent.
+
+Finance acceptance requires an independently approved example for each definition/entity. Record the exact user question, the authoritative export with date/currency/filters, and expected amounts; turn every confirmed defect into a regression case. Never suppress a verification failure just to return a number. Real ChatGPT acceptance and finance sign-off remain explicit release evidence beyond software tests.

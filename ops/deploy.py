@@ -2,6 +2,11 @@ import os,pathlib,subprocess,json,time,urllib.request,shutil,tarfile,sys,re,fcnt
 os.umask(0o077)
 commit=sys.argv[1] if len(sys.argv)>1 else ''; assert re.fullmatch(r'[a-f0-9]{40}',commit),'Supply an exact Git commit SHA'
 root=pathlib.Path('/opt/via/zoho-mcp')
+checkconfig=pathlib.Path('/opt/via/zoho-mcp-release-check.json')
+acceptance=json.loads(checkconfig.read_text()) if checkconfig.exists() else None
+if acceptance:
+ assert set(acceptance)=={'user_id','invoice_organization_id'},'Invalid release acceptance configuration'
+ assert all(isinstance(v,str) and re.fullmatch(r'[A-Za-z0-9_-]{1,200}',v) for v in acceptance.values()),'Invalid acceptance identifiers'
 stage=pathlib.Path('/opt/via/zoho-mcp-releases')/commit
 backup=pathlib.Path('/opt/via/zoho-mcp-backups')/(datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S')+'-'+commit[:7])
 stage.mkdir(parents=True,exist_ok=True); backup.mkdir(parents=True,exist_ok=True)
@@ -73,11 +78,19 @@ try:
  assert ok,'Deployment health verification failed'
  assert h['readOnly']==(oldenv['ZOHO_READ_ONLY'].lower()!='false')
  assert users.issubset(set(sql('SELECT id FROM users').splitlines())),'An existing linked account disappeared'
+ reportcheck={'status':'not_configured'}
+ if acceptance:
+  print('Checking complete reports through the public MCP with the original client schema',flush=True)
+  checked=subprocess.run(['docker','exec','-w','/app','zoho-mcp-app','node','scripts/smoke-reports.mjs',acceptance['user_id'],acceptance['invoice_organization_id']],capture_output=True,text=True,timeout=420)
+  try:reportcheck=json.loads(checked.stdout.strip() or checked.stderr.strip())
+  except Exception:reportcheck={'status':'failed','reason':'Live report command did not return a structured result'}
+  (stage/'report-acceptance.json').write_text(json.dumps(reportcheck))
+  assert checked.returncode==0 and reportcheck['status']=='passed' and reportcheck['build_id']==commit,'Live report acceptance failed; inspect report-acceptance.json'
  after=json.loads(out(['docker','inspect',*list(baseline)]))
  changed=[x['Name'] for x in after if baseline[x['Name']]!=(x['Id'],x['State']['StartedAt'],x['RestartCount'])]
  result={'status':'deployed','health':h,'existing_linked_accounts_preserved':len(users),'refresh_credentials_before':refresh_before,
  'refresh_credentials_after':int(sql("SELECT count(*) FROM oauth_tokens WHERE kind='refresh' AND expires_at>now()")),
- 'other_containers_checked':len(baseline),'other_containers_changed':changed,'backup':str(backup)}
+ 'other_containers_checked':len(baseline),'other_containers_changed':changed,'backup':str(backup),'report_acceptance':reportcheck}
  resultpath.write_text(json.dumps(result));print(json.dumps(result),flush=True)
 except Exception as e:
  print('Deployment failed:',str(e),flush=True)

@@ -103,6 +103,10 @@ export async function migrate() {
       category TEXT NOT NULL, outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE connector_events ADD COLUMN IF NOT EXISTS reference_id TEXT;
+    ALTER TABLE connector_events ADD COLUMN IF NOT EXISTS build_id TEXT;
+    ALTER TABLE connector_events ADD COLUMN IF NOT EXISTS report_id TEXT;
+    CREATE INDEX IF NOT EXISTS connector_events_recent_idx ON connector_events(user_id,created_at DESC);
   `);
 
   // Transactional, restart-safe upgrade of legacy plaintext credentials.
@@ -372,16 +376,17 @@ export async function reportJobStatus(reportId,userId) {
   const {rows}=await pool.query('SELECT state,failures,run_after,updated_at FROM report_jobs WHERE report_id=$1 AND user_id=$2',[reportId,userId]);
   return rows[0] || null;
 }
-export async function recordEvent(userId,category,outcome,duration=0) {
-  await pool.query('INSERT INTO connector_events(user_id,category,outcome,duration_ms) VALUES($1,$2,$3,$4)',[userId,category,outcome,Math.min(2147483647,Math.max(0,Math.round(duration)))]);
+export async function recordEvent(userId,category,outcome,duration=0,info={}) {
+  await pool.query('INSERT INTO connector_events(user_id,category,outcome,duration_ms,reference_id,build_id,report_id) VALUES($1,$2,$3,$4,$5,$6,$7)',[userId,category,outcome,Math.min(2147483647,Math.max(0,Math.round(duration))),info.reference||null,info.build_id||process.env.BUILD_ID||'development',info.report_id||null]);
 }
 export async function operationalStatus(userId) {
-  const [jobs,events,refs]=await Promise.all([
+  const [jobs,events,refs,failures]=await Promise.all([
     pool.query('SELECT state,count(*)::int AS count FROM report_jobs WHERE user_id=$1 GROUP BY state',[userId]),
     pool.query("SELECT category,outcome,count(*)::int AS count,round(avg(duration_ms))::int AS average_ms FROM connector_events WHERE user_id=$1 AND created_at>now()-interval '24 hours' GROUP BY category,outcome",[userId]),
     pool.query('SELECT count(*)::int AS count FROM finance_references WHERE user_id=$1 AND expires_at>now()',[userId]),
+    pool.query("SELECT category,outcome,reference_id,build_id,report_id,created_at FROM connector_events WHERE user_id=$1 AND created_at>now()-interval '24 hours' AND outcome IN ('error','schema_error','unknown_tool','verification_failed','concurrency_limited','failed') ORDER BY created_at DESC,id DESC LIMIT 20",[userId]),
   ]);
-  return {jobs:jobs.rows,events_last_24_hours:events.rows,installed_finance_references:refs.rows[0].count};
+  return {jobs:jobs.rows,events_last_24_hours:events.rows,installed_finance_references:refs.rows[0].count,recent_failures:failures.rows};
 }
 export async function saveWrite(id, userId, key, payload) {
   const r = await pool.query("INSERT INTO write_operations(id,user_id,request_key,payload,expires_at) VALUES($1,$2,$3,$4,now()+interval '10 minutes') ON CONFLICT(user_id,request_key) DO NOTHING RETURNING id", [id,userId,key,encrypt(JSON.stringify(payload))]);

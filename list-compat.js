@@ -42,11 +42,8 @@ export function legacyAction(tool,args,module) {
 }
 
 // Rewrite only authored control fields, never source record text or instructions.
-export function compatibleListResult(result,args) {
-  return {...result,content:result.content.map(block=>{
-    if(block.type!=='text')return block;
-    let value;try{value=JSON.parse(block.text);}catch{return block;}
-    if(!value||typeof value!=='object'||Array.isArray(value))return block;
+export function compatibleListValue(value,args) {
+    if(!value||typeof value!=='object'||Array.isArray(value))return value;
     const rewrite=value=>{
       for(const key of ['next_action','tool_for_customer_receivables']) {
         const action=value?.[key];if(!action?.tool)continue;
@@ -54,7 +51,10 @@ export function compatibleListResult(result,args) {
         if(mapped)value[key]={...action,...mapped};
       }
     };
-    rewrite(value);if(value.section==='summary')rewrite(value.data);
+    rewrite(value);
+    // A raw pointer contains an authored response saved by reply(), not an
+    // arbitrary Zoho row. Convert its controls BEFORE fragment serialization.
+    if(value.section==='summary'||value.section==='raw')rewrite(value.data);
     if(value.response_stored) {
       value.next_action=legacyAction('ZohoBooks_get_report',{report_id:value.report_id,section:'raw'},args.module);
       value.instruction='Use the existing ZohoBooks_list tool with next_action.arguments to read the saved response. No new tool discovery is required.';
@@ -65,6 +65,13 @@ export function compatibleListResult(result,args) {
     } else if(value.next_page && value.section) {
       value.next_action=legacyAction('ZohoBooks_get_report',{report_id:value.report_id,section:value.section,page:value.next_page,per_page:args.per_page||100},args.module);
     }
-    return {...block,text:JSON.stringify(value)};
+    return value;
+}
+
+export function compatibleListResult(result,args) {
+  return {...result,content:result.content.map(block=>{
+    if(block.type!=='text')return block;
+    let value;try{value=JSON.parse(block.text);}catch{return block;}
+    return {...block,text:JSON.stringify(compatibleListValue(value,args))};
   })};
 }

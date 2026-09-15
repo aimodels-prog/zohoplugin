@@ -15,6 +15,14 @@ import { verifyDownloadTicket, renderExport } from "./report-export.js";
 import { calculate, selectOrganizations } from "./reporting.js";
 import { MODULES } from "./modules.js";
 import { zohoRequest } from "./zoho.js";
+import { diagnostic, inputFailure, resultOutcome } from './diagnostics.js';
+
+const inputSchemas = new Map(tools.map(tool => [tool.name, { tool, schema: z.object(tool.schema).strict() }]));
+async function recordFailure(userId, category, outcome, duration, info) {
+  console.error(JSON.stringify({category:'connector_failure',tool:category,outcome,...info}));
+  try { await db.recordEvent(userId,category,outcome,duration,info); }
+  catch { console.error(JSON.stringify({category:'diagnostic_storage_failed',reference:info.reference})); }
+}
 
 export function createMcpServer() {
   const server = new McpServer({ name: "zoho-books", version: VERSION }, { instructions });
@@ -26,17 +34,22 @@ export function createMcpServer() {
       const started=Date.now();
       try {
         const result=await tool.run(args,userId);
-        db.recordEvent(userId,tool.name,result.isError?"error":"ok",Date.now()-started).catch(()=>{});
+        const outcome=resultOutcome(result);
+        if(outcome.outcome!=='ok') {
+          const info=diagnostic(outcome.outcome,outcome.report_id);
+          await recordFailure(userId,tool.name,outcome.outcome,Date.now()-started,info);
+          return {...result,content:[...result.content,{type:'text',text:JSON.stringify({diagnostics:info})}]};
+        }
+        db.recordEvent(userId,tool.name,'ok',Date.now()-started).catch(()=>{});
         return result;
       }
       catch (error) {
-        const ref = crypto.randomUUID();
-        console.error("[tool] failed", { ref, tool: tool.name, type: error.name });
-        db.recordEvent(userId,tool.name,"error",Date.now()-started).catch(()=>{});
+        const info=diagnostic('error');
+        await recordFailure(userId,tool.name,'error',Date.now()-started,info);
         // Validation errors are authored locally. Never expose database/transport details.
         const safeMessage = error.name === "Error" && !error.code && !error.cause
           ? error.message : "Operation could not complete; no result was verified";
-        return { content: [{ type: "text", text: safeMessage + " (reference " + ref + ")" }], isError: true };
+        return { content: [{ type: "text", text: safeMessage },{type:'text',text:JSON.stringify({diagnostics:info})}], isError: true };
       }
     });
   }
@@ -93,12 +106,30 @@ export function createApp(publicUrl) {
   const active = new Map();
   app.post("/mcp", requireBearerAuth({ verifier: provider, resourceMetadataUrl }), async (req,res) => {
     const user = req.auth.extra.userId;
-    if ((active.get(user) || 0) >= 2) return res.status(429).json({ error: "Too many concurrent requests" });
+    if ((active.get(user) || 0) >= 2) {
+      const info=diagnostic('concurrency_limited');
+      await recordFailure(user,'mcp','concurrency_limited',0,info);
+      return res.status(429).set('Retry-After','2').json({error:'Too many concurrent requests',...info});
+    }
     active.set(user, (active.get(user) || 0) + 1);
     const server = createMcpServer();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on("close", () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
-    try { await server.connect(transport); await transport.handleRequest(req, res, req.body); }
+    try {
+      // SDK input failures occur before the registered callback. Validate using
+      // the very same schemas here so these failures are observable, too.
+      const body=req.body;
+      if(body?.jsonrpc==='2.0' && ['string','number'].includes(typeof body.id) && body.method==='tools/call' && typeof body.params?.name==='string') {
+        const registered=inputSchemas.get(body.params.name);
+        const parsed=registered?.schema.safeParse(body.params.arguments||{});
+        if(!registered || !parsed.success) {
+          const {info,result}=inputFailure(registered?.tool,parsed);
+          await recordFailure(user,registered?.tool.name||'mcp_unknown_tool',info.code,0,info);
+          return res.json({jsonrpc:'2.0',id:body.id,result});
+        }
+      }
+      await server.connect(transport); await transport.handleRequest(req, res, req.body);
+    }
     catch (error) {
       console.error("[mcp] failed", { type: error.name });
       if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: req.body?.id ?? null });
